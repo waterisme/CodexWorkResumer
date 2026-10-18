@@ -1,20 +1,22 @@
 # Public release readiness (local draft, 2026-10-18)
 
-This is a preparation record, not approval to publish. Do not create a new
-repository, push a branch or tag, publish a GitHub Release, or replace an
-installed copy until the maintainer separately confirms the exact target.
+This is a preparation record, not a claim that the public history has been
+purged or that the release has passed live acceptance. The maintainer has
+conditionally authorized pushing a clean snapshot only after sensitive-data
+review; no tag, GitHub Release, or installed-copy replacement was authorized.
 
 ## Scope and ownership
 
 - CodexWorkResumer is a fork of `sybxxx/codex-auto-retry`. Keep the upstream
   Git relationship and original MIT attribution. Fork changes are also under
   MIT; see `LICENSE` and `THIRD_PARTY_NOTICES.md`.
-- A public `waterisme/CodexWorkResumer` fork already exists. Before any
-  publication, decide whether to update that fork or use another target.
-- The fork's already-public `codex/codexworkresumer` branch contains an old
-  personal drive path in `docs/architecture-analysis.md`. A clean new commit
-  cannot retract that branch or its public history; handle it separately with
-  maintainer approval. Do not force-push or delete it during preparation.
+- A public `waterisme/CodexWorkResumer` fork already exists. Its old
+  `codex/codexworkresumer` branch was deleted on 2026-10-18 after maintainer
+  confirmation. The old commit remains readable by SHA and contains a personal
+  drive path in `docs/architecture-analysis.md`. Deleting the branch did not
+  purge that public history. The maintainer reviewed this finding and accepted
+  that residual folder path for source publication on 2026-10-18; do not claim
+  the old commit was removed.
 - The local development branch has unpublished commits with older personal
   paths and screenshots in its history. **Do not push its history verbatim.**
   Prepare a clean publication commit from the agreed public base, preserving
@@ -50,8 +52,9 @@ source files are still subject to a separate Git-content review.
    non-exhausted quota shown as waiting for reset, and an unselected/inactive
    Session shown as waiting for automatic resume. No core behavior was changed
    during this publication-preparation pass.
-6. Obtain the maintainer's explicit approval for target repo, clean history,
-   release tag, ZIP/hash, and public announcement before any network write.
+6. Push only after the conditional sensitive-data gate is met. Obtain separate
+   maintainer approval for a release tag, ZIP attachment, and public
+   announcement.
 
 Static scans and automated tests cannot prove that all live Codex behaviors
 work correctly. Until gates 1-6 are complete, this is a local candidate only.
@@ -75,3 +78,17 @@ work correctly. Until gates 1-6 are complete, this is a local candidate only.
   modules, and 96 npm packages.
 - No installed application was replaced. No commit was pushed, tag created,
   or GitHub Release published during this preparation pass.
+
+## Follow-up audit (2026-10-18)
+
+- The candidate source tree and ZIP were scanned for the local account and
+  personal drive path, common credential formats, and runtime-record filenames;
+  no matching personal path or credential was found in the candidate. The ZIP
+  hash matches its companion checksum file and contains 193 entries.
+- Version verification, `go vet`, TypeScript typecheck, and locked-dependency
+  license-bundle verification passed. The full Go test suite still fails on
+  Windows user-environment/registry access denial in this test context.
+- GitHub's branch API lists only `main`, but the old commit is still available
+  directly by SHA. The maintainer accepted this low-risk residual folder path
+  and authorized a clean source push, not a Release. At the time of this audit
+  record, no new commit had been pushed or Release published.
