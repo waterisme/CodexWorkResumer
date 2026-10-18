@@ -20,9 +20,9 @@ foreach ($name in $functions) {
 }
 $topLevel = $ast.EndBlock.Statements
 $recoveryCall = @($topLevel | Where-Object { $_.Extent.Text -eq 'Recover-IncompleteInstall' })[0]
-$desktopGate = @($topLevel | Where-Object { $_.Extent.Text -like 'if (Test-CodexDesktopRunning)*' })[0]
+$desktopGate = @($topLevel | Where-Object { $_.Extent.Text -match '^if \(\$desktopRunning -and \(Test-SharedBackendInUse\)\)' })[0]
 if (-not $desktopGate -or $desktopGate.Extent.StartOffset -gt $recoveryCall.Extent.StartOffset) {
-    throw 'Desktop must be closed before journal recovery or installation writes.'
+    throw 'An active shared recovery channel must be gated before journal recovery or installation writes.'
 }
 $transaction = @($topLevel | Where-Object { $_ -is [System.Management.Automation.Language.TryStatementAst] })[-1]
 $migration = @($transaction.Body.Statements | Where-Object { $_.Extent.Text -like '$environmentMigration = Restore-CodexAutoRetrySharedEnvironment*' })
@@ -36,8 +36,8 @@ $rollbackInstall = $deployAst.Find({ param($node)
 if ($rollbackInstall -or $deploySource -notmatch 'Disable-CodexAutoRetryLegacyRouting -DataDir \$runtimePath') {
     throw 'Release rollback can invoke an unsafe previous installer.'
 }
-if ($deploySource -match '\(Test-SharedBackendInUse -RuntimePath \$runtimePath\) -and \(Test-CodexDesktopRunning\)') {
-    throw 'Release update still allows modification while official Desktop is running.'
+if ($deploySource -notmatch '\(Test-CodexDesktopRunning\) -and \(Test-SharedBackendInUse -RuntimePath \$runtimePath\)') {
+    throw 'Release update is missing the active shared-channel safety gate.'
 }
 $recoveryBlock = $deployAst.Find({ param($node)
     $node -is [System.Management.Automation.Language.StatementBlockAst] -and

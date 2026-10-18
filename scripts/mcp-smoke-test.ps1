@@ -174,15 +174,15 @@ try {
     if ($content.mimeType -ne 'text/html;profile=mcp-app' -or $content.text.Length -lt 50000) {
         throw 'Embedded MCP App resource is missing or incomplete.'
     }
-    if (-not $content.text.Contains('Codex Auto Retry')) { throw 'Embedded panel identity is missing.' }
-    $recoveryCounterLabel = ([char]0x672c).ToString() + [char]0x6b21 + [char]0x6545 + [char]0x969c + [char]0x6062 + [char]0x590d
-    $consecutiveCounterLabel = ([char]0x8fde).ToString() + [char]0x7eed + [char]0x65e0 + [char]0x8fdb + [char]0x5c55
+    if (-not $content.text.Contains('CodexWorkResumer')) { throw 'Embedded panel identity is missing.' }
+    $recoveryCounterLabel = ([char]0x672c).ToString() + [char]0x6b21 + [char]0x6545 + [char]0x969c + [char]0x6062 + [char]0x5fa9
+    $consecutiveCounterLabel = ([char]0x9023).ToString() + [char]0x7e8c + [char]0x7121 + [char]0x9032 + [char]0x5c55
     if (-not $content.text.Contains($recoveryCounterLabel) -or -not $content.text.Contains($consecutiveCounterLabel)) {
         throw 'Embedded panel does not distinguish the two retry counters.'
     }
 
-    $defaultPrompt = ([char]0x7ee7).ToString() + [char]0x7eed
-    $updatedPrompt = $defaultPrompt + [char]0x5904 + [char]0x7406
+    $defaultPrompt = ([char]0x7e7c).ToString() + [char]0x7e8c
+    $updatedPrompt = $defaultPrompt + [char]0x8655 + [char]0x7406
     $status = Call-MCPTool $process 4 'get_auto_retry_status'
     $pendingRetry = @($status.structuredContent.retries | Where-Object thread_id -eq $threadId)[0]
     if ($status.structuredContent.retry_prompt -ne $defaultPrompt -or

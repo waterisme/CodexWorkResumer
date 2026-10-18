@@ -40,6 +40,32 @@ func TestParseObjectError(t *testing.T) {
 	}
 }
 
+func TestParseStructuredUsageLimitWithoutRetainingResetDetails(t *testing.T) {
+	tests := []struct {
+		name     string
+		error    map[string]any
+		wantCode string
+	}{
+		{"snake code", map[string]any{"message": "provider error", "codex_error_info": "usage_limit_exceeded"}, "usage_limit_exceeded"},
+		{"camel code", map[string]any{"message": "provider error", "codexErrorInfo": "usageLimitExceeded"}, "usageLimitExceeded"},
+		{"tagged code", map[string]any{"message": "provider error", "codex_error_info": map[string]any{
+			"usageLimitExceeded": map[string]any{"resetsAt": "private reset details"},
+		}}, "usageLimitExceeded"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			event, ok := parseRelevantEvent(makeEventLine(t, "2026-10-09T00:00:00Z", "task_complete", "quota-turn", test.error))
+			if !ok || !strings.Contains(event.ErrorText, test.wantCode) || strings.Contains(event.ErrorText, "private reset details") {
+				t.Fatalf("structured error code was not extracted privately: %+v, ok=%v", event, ok)
+			}
+			decision := classifyCompletionFailure(event, defaultConfig())
+			if !decision.Retry || decision.Class != classRateLimit {
+				t.Fatalf("structured quota event was not rate limited: %+v", decision)
+			}
+		})
+	}
+}
+
 func TestParseAndClassifyCCSwitchUpstreamError(t *testing.T) {
 	structured := `{"error":{"message":"CC Switch local proxy failed while handling Codex endpoint /responses. upstream_status: HTTP 400; cause: Upstream request failed","type":"upstream_error","code":"cc_switch_upstream_error","upstream_status":400}}`
 	line := makeEventLine(t, "2026-08-10T02:37:16.064Z", "task_complete", "turn-cc-switch", map[string]any{

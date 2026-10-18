@@ -11,9 +11,13 @@ and restarts it after unexpected exits with bounded backoff. The user does not n
 plugin in each Codex task. Its MCP management panel is optional and does not
 need to remain open for retries to work.
 
-The watchdog worker owns a Windows notification-area icon. Double-click opens
-the graphical settings window; right-click shows status, pause/resume, settings,
-and exit. This is not a second watchdog or a separate retry engine.
+The watchdog worker owns a Windows notification-area icon. Single- or
+double-click opens the graphical settings window, and right-click shows
+status, pause/resume, settings, and exit. This is not a
+second watchdog or a separate retry engine. On watchdog startup, the saved
+Codex Auto-Resume Assistant preference is applied once: an enabled preference
+runs a bounded health check and reconnect attempt, while a disabled preference
+keeps the recovery channel off.
 
 ## Recovery Behavior
 
@@ -43,7 +47,13 @@ and exit. This is not a second watchdog or a separate retry engine.
   the first UUID as the task ID. The watchdog migrates older turn-keyed state
   and merges duplicate entries for the same task during startup.
 - Never open a task link, focus Codex, switch the task currently displayed,
-  launch `codex exec resume`, or create a hidden external Codex task.
+  manually launch `codex exec resume`, or create a hidden external Codex task.
+  The watchdog's separate CLI Resume fallback is disabled by default and may
+  run only after the user explicitly enables it, the normal Desktop route is
+  proven unavailable, and the failure is an allowlisted ordinary recovery.
+  It resumes the same session with the fixed fallback prompt over stdin, never
+  for goals or empty responses, and never redispatches automatically after its
+  bounded 30-minute lifecycle expires.
 - If one target task is already active, delay only that task. Other failed
   tasks retain their own queue entries and can retry independently.
 - For an internal subagent empty reply, inject one deterministic recovery event
@@ -66,7 +76,7 @@ and exit. This is not a second watchdog or a separate retry engine.
   failures by default instead of refreshing the countdown forever.
   `codex_restart_required` means an older Desktop build has no verified recovery
   route and the user must fully exit Codex and reopen it through
-  `安全启动Codex.vbs` or the startup manager's safe-launch button. Current
+  `安全啟動Codex.vbs` or the startup manager's safe-launch button. Current
   Windows Desktop builds may instead report `official_ipc_ready`: the watchdog
   has verified the official named-pipe router, discovered the task owner, and
   can submit an empty-input recovery request without changing global routing.
@@ -87,7 +97,7 @@ compatibility fallback text.
   plugin-owned endpoint and stops only the plugin-owned server.
 
 - Use `set_retry_prompt` to change only the fallback text. The default is
-  `继续`, the maximum is 500 characters, and changes apply without restarting
+  `繼續`, the maximum is 500 characters, and changes apply without restarting
   the watchdog. Normal retries do not send this text when silent continuation
   is supported.
 - Use `set_retry_settings` to change the fallback text, both retry limits,
@@ -105,6 +115,13 @@ compatibility fallback text.
   that pausing terminates a retry that already started.
 - Use `retry_now` or `cancel_retry` only with a task ID returned in the pending
   queue. Cancel cannot undo a retry that already started.
+- The Windows main-window checkbox is a persistent quota watchlist, not a
+  `retry_now` command. A running task may be checked in advance without being
+  resumed. Dragging its row sets the order for the next eligible quota
+  dispatch; manual Resume uses highlighted rows. With no watchlist file yet,
+  the legacy all-task quota rescue remains active. Temporary-failure rescue
+  is unchanged. Do not interpret the MCP panel's action buttons as watchlist
+  selection.
 - Use `restart_retry` only for a task reported as stopped at its retry limit.
   It starts a fresh attempt budget and requests an immediate retry.
 - Never open the panel automatically, navigate to another task, or focus Codex.
@@ -207,14 +224,14 @@ is active; clear the value deliberately before re-enabling shared mode.
 
 ## Startup Manager And Remove
 
-The release includes `启动管理器.cmd`. Use it when Windows Explorer does not
+The release includes `啟動管理器.cmd`. Use it when Windows Explorer does not
 show the full `HKCU\...\Run` command: it reports the exact startup entry,
 supervisor/worker process chain, heartbeat, shared mode, endpoint, and stale
 state, and provides start, stop, enable, disable, safe-disable, and uninstall
 actions. `安全停用.cmd` performs only the break-glass shared-backend cleanup.
 Both tools operate only on paths and state records owned by this plugin.
 
-Complete removal still uses the release's `卸载.cmd` or
+Complete removal still uses the release's `卸載.cmd` or
 `uninstall-release.ps1`; the graphical manager's default uninstall preserves
 runtime settings/state/logs, while its destructive option asks for confirmation.
 The command-line destructive path requires `-RemoveData -NoPrompt` explicitly.
@@ -300,7 +317,7 @@ the environment change, and never removes chat data or a user-owned
 `CODEX_API_KEY`. A worker restart adopts a healthy owned endpoint. If a live
 Codex Desktop is still using the shared server, cleanup is deferred and the
 worker retries it after Desktop closes; dead owned state is removed immediately.
-Stale PID or heartbeat data must be shown as `后台服务未运行`, never as healthy
+Stale PID or heartbeat data must be shown as `背景服務未執行`, never as healthy
 `running`.
 
 The optional shared app-server has a monitor-only 4096 MB private-memory limit.

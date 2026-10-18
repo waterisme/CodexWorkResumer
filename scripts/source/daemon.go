@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,6 +12,16 @@ import (
 )
 
 var errStopRequested = errors.New("stop requested")
+
+const (
+	statusHeartbeatInterval         = 10 * time.Second
+	statePruneInterval              = 60 * time.Second
+	stateIdleRecheckInterval        = 60 * time.Second
+	stateActiveRecheckInterval      = 10 * time.Second
+	stateFileCheckInterval          = 10 * time.Second
+	readyControllerProbeInterval    = 30 * time.Second
+	recoveryControllerProbeInterval = 10 * time.Second
+)
 
 type daemon struct {
 	config      Config
@@ -31,19 +41,34 @@ type daemon struct {
 	active                              map[string]RetryJob
 	activeCtx                           map[string]context.CancelFunc
 	lastScan                            time.Time
+	lastHealthyScan                     time.Time
+	lastStatePersist                    time.Time
+	lastStatePrune                      time.Time
+	lastStateFileCheck                  time.Time
+	lastPersistedStateHash              [sha256.Size]byte
+	hasPersistedState                   bool
+	lastPersistedFileSize               int64
+	lastPersistedFileModTime            time.Time
+	hasPersistedFileMetadata            bool
+	lastHeartbeat                       time.Time
+	lastStatusPersist                   time.Time
+	lastPublishedStatus                 StatusSnapshot
+	lastRootCount                       int
 	lastError                           string
 	controllerState                     string
 	lastControllerProbe                 time.Time
 	paused                              bool
+	monitoringPaused                    bool
 	memoryUsageBytes                    uint64
 	memoryGuardTriggered                bool
 	sharedAppServerMemoryBytes          uint64
 	sharedAppServerMemoryGuardTriggered bool
 	lastSharedAppServerMemoryCheck      time.Time
-	writeState                          func(string, any) error
+	writeState                          func(string, []byte) error
 	writeStatusFile                     func(string, any) error
 	stateWriteDeferred                  bool
 	statusWriteDeferred                 bool
+	taskPlanErrorLogged                 bool
 }
 
 func newDaemon(config Config, dataDir string, logger *safeLogger, runner resumeRunner) (*daemon, error) {
@@ -67,29 +92,24 @@ func newDaemon(config Config, dataDir string, logger *safeLogger, runner resumeR
 		return nil, err
 	}
 	daemon := &daemon{
-		config:          config,
-		dataDir:         dataDir,
-		statePath:       statePath,
-		statusPath:      filepath.Join(dataDir, "status.json"),
-		stopPath:        filepath.Join(dataDir, "stop.signal"),
-		controlPath:     controlPath,
-		commandDir:      filepath.Join(dataDir, "commands"),
-		logger:          logger,
-		runner:          runner,
-		startedAt:       time.Now().UTC(),
-		state:           state,
-		active:          make(map[string]RetryJob),
-		activeCtx:       make(map[string]context.CancelFunc),
-		paused:          control.Paused,
-		controllerState: "starting",
-		writeState: func(path string, value any) error {
-			state, ok := value.(RuntimeState)
-			if !ok {
-				return fmt.Errorf("runtime state writer received %T", value)
-			}
-			return writeRuntimeStateAtomic(path, state)
-		},
-		writeStatusFile: writeJSONAtomic,
+		config:           config,
+		dataDir:          dataDir,
+		statePath:        statePath,
+		statusPath:       filepath.Join(dataDir, "status.json"),
+		stopPath:         filepath.Join(dataDir, "stop.signal"),
+		controlPath:      controlPath,
+		commandDir:       filepath.Join(dataDir, "commands"),
+		logger:           logger,
+		runner:           runner,
+		startedAt:        time.Now().UTC(),
+		state:            state,
+		active:           make(map[string]RetryJob),
+		activeCtx:        make(map[string]context.CancelFunc),
+		paused:           control.Paused,
+		monitoringPaused: control.MonitoringPaused,
+		controllerState:  "starting",
+		writeState:       writeBytesAtomic,
+		writeStatusFile:  writeJSONAtomic,
 	}
 	daemon.reconcileStartupState(time.Now().UTC())
 	return daemon, nil
@@ -119,26 +139,63 @@ func (d *daemon) tick(ctx context.Context, now time.Time) error {
 		_ = os.Remove(d.stopPath)
 		return errStopRequested
 	}
+	control, controlErr := loadOrCreateControlState(d.controlPath)
+	d.mu.Lock()
+	if controlErr != nil {
+		d.lastError = controlErr.Error()
+		d.logger.Printf("control state failed category=control_state")
+	} else {
+		d.paused = control.Paused
+		d.monitoringPaused = control.MonitoringPaused
+	}
+	d.lastHeartbeat = now
+	if d.monitoringPaused {
+		statusErr := d.writeStatusLocked(true, d.lastRootCount)
+		d.mu.Unlock()
+		if statusErr != nil {
+			d.logger.Printf("status save deferred category=status_write")
+		}
+		return nil
+	}
+	d.mu.Unlock()
 
 	d.processSharedRecovery(ctx, now)
 	controllerReady := d.controllerRestartReady(ctx, now)
 	d.mu.Lock()
+	reopened := false
 	if controllerReady {
-		d.reopenRestartRequiredLocked(now)
+		reopened = d.reopenRestartRequiredLocked(now)
 	}
 	d.reloadConfigLocked()
-	roots := discoverSessionRoots(d.config)
 	baseline := !d.state.Initialized
-	events, scanErr := scanSessions(roots, &d.state, now, baseline)
-	if baseline {
-		d.state.Initialized = true
-		d.logger.Printf("initialized session baseline roots=%d", len(roots))
-	}
-	if scanErr != nil {
-		d.lastError = scanErr.Error()
-		d.logger.Printf("scan failed category=session_scan")
-	} else {
-		d.lastError = ""
+	manualScan := consumeTaskScanRequest(d.dataDir)
+	scanInterval := time.Duration(d.config.ScanIntervalSeconds) * time.Second
+	shouldScan := baseline || manualScan || (d.config.AutoScanEnabled && (d.lastScan.IsZero() || now.Sub(d.lastScan) >= scanInterval))
+	rootCount := d.lastRootCount
+	var events []scannedEvent
+	var scanErr error
+	if shouldScan {
+		roots := discoverSessionRoots(d.config)
+		rootCount = len(roots)
+		events, scanErr = scanSessions(roots, &d.state, now, baseline)
+		if baseline {
+			d.state.Initialized = true
+			d.logger.Printf("initialized session baseline roots=%d", len(roots))
+		}
+		if scanErr != nil {
+			d.lastError = scanErr.Error()
+			d.logger.Printf("scan failed category=session_scan")
+		} else {
+			d.lastError = ""
+			if rootCount > 0 {
+				d.lastHealthyScan = now
+			}
+		}
+		d.lastScan = now
+		d.lastRootCount = rootCount
+		if manualScan {
+			d.logger.Debugf("manual task scan completed roots=%d events=%d", rootCount, len(events))
+		}
 	}
 	sort.SliceStable(events, func(i, j int) bool {
 		return events[i].Event.Timestamp.Before(events[j].Event.Timestamp)
@@ -152,8 +209,8 @@ func (d *daemon) tick(ctx context.Context, now time.Time) error {
 		}
 		d.handleEventLocked(item, now)
 	}
-	d.refreshControlsLocked(now)
-	d.expireUnacknowledgedLocked(now)
+	controlsChanged := d.refreshControlsLocked(now)
+	expired := d.expireUnacknowledgedLocked(now)
 	sharedBackendEnabled := d.config.SharedAppServerEnabled
 	// Acknowledged turns normally finish through rollout events. If a previous
 	// process stopped after task_started, release the mutex while the optional
@@ -164,14 +221,45 @@ func (d *daemon) tick(ctx context.Context, now time.Time) error {
 	if !sharedBackendEnabled {
 		d.reconcileSharedBackendCleanup(ctx)
 	}
-	d.reconcileAwaitingLifecycle(ctx, now)
+	lifecycleChanged := d.reconcileAwaitingLifecycle(ctx, now)
 	d.mu.Lock()
+	pendingBeforeDispatch := pendingRetryCount(d.state)
 	jobs := d.dispatchDueLocked(now)
-	d.lastScan = now
-	d.state.prune(now)
-	stateErr := d.persistStateLocked()
-	statusErr := d.writeStatusLocked(true, len(roots))
+	d.lastHeartbeat = now
+	pruneDue := d.lastStatePrune.IsZero() || now.Sub(d.lastStatePrune) >= statePruneInterval ||
+		len(d.state.ProcessedEvents) > maxProcessedEventEntries ||
+		len(d.state.Files) > maxFileCursorEntries
+	if pruneDue {
+		d.state.prune(now)
+		d.lastStatePrune = now
+	}
+	pendingCount := pendingRetryCount(d.state)
+	activeCount := len(d.active)
+	var stateErr error
+	stateFileNeedsRepair := false
+	if d.hasPersistedFileMetadata && (d.lastStateFileCheck.IsZero() || now.Sub(d.lastStateFileCheck) >= stateFileCheckInterval) {
+		d.lastStateFileCheck = now
+		info, err := os.Stat(d.statePath)
+		stateFileNeedsRepair = err != nil || info.Size() != d.lastPersistedFileSize ||
+			!info.ModTime().Equal(d.lastPersistedFileModTime)
+	}
+	recheckInterval := stateIdleRecheckInterval
+	if pendingCount > 0 || activeCount > 0 {
+		recheckInterval = stateActiveRecheckInterval
+	}
+	if shouldScan || len(jobs) > 0 || reopened || controlsChanged || expired || lifecycleChanged ||
+		pendingBeforeDispatch != pendingCount || pruneDue || stateFileNeedsRepair || d.stateWriteDeferred ||
+		d.lastStatePersist.IsZero() || now.Sub(d.lastStatePersist) >= recheckInterval {
+		stateErr = d.persistStateLocked()
+		if stateErr == nil {
+			d.lastStatePersist = now
+		}
+	}
+	statusErr := d.writeStatusLocked(true, rootCount)
 	d.mu.Unlock()
+	if shouldScan {
+		d.logger.Debugf("scan completed roots=%d events=%d queued_jobs=%d pending_retries=%d active_retries=%d", rootCount, len(events), len(jobs), pendingCount, activeCount)
+	}
 
 	for _, job := range jobs {
 		d.wg.Add(1)
@@ -191,6 +279,16 @@ func (d *daemon) tick(ctx context.Context, now time.Time) error {
 		d.logger.Printf("status save deferred category=status_write")
 	}
 	return nil
+}
+
+func pendingRetryCount(state RuntimeState) int {
+	count := 0
+	for _, thread := range state.Threads {
+		if thread.Pending != nil {
+			count++
+		}
+	}
+	return count
 }
 
 func (d *daemon) checkSharedAppServerMemory(ctx context.Context, now time.Time) {
@@ -260,14 +358,44 @@ func (d *daemon) reconcileSharedBackendCleanup(ctx context.Context) {
 }
 
 func (d *daemon) persistStateLocked() error {
-	writer := d.writeState
-	if writer == nil {
-		writer = writeJSONAtomic
-	}
-	if err := writer(d.statePath, d.state); err != nil {
+	data, err := marshalRuntimeState(d.state)
+	if err != nil {
 		d.stateWriteDeferred = true
 		d.lastError = "state_write_deferred"
 		return err
+	}
+	hash := sha256.Sum256(data)
+	if d.hasPersistedState && hash == d.lastPersistedStateHash {
+		// A missing or externally replaced state.json must be repaired even
+		// when the in-memory state is unchanged. Stat is cheap compared with
+		// encoding and atomically rewriting a large state file.
+		if info, err := os.Stat(d.statePath); err == nil && d.hasPersistedFileMetadata &&
+			info.Size() == d.lastPersistedFileSize && info.ModTime().Equal(d.lastPersistedFileModTime) {
+			d.stateWriteDeferred = false
+			if d.lastError == "state_write_deferred" {
+				d.lastError = ""
+			}
+			return nil
+		}
+	}
+	writer := d.writeState
+	if writer == nil {
+		writer = writeBytesAtomic
+	}
+	if err := writer(d.statePath, data); err != nil {
+		d.stateWriteDeferred = true
+		d.lastError = "state_write_deferred"
+		return err
+	}
+	d.lastPersistedStateHash = hash
+	d.hasPersistedState = true
+	if info, err := os.Stat(d.statePath); err == nil {
+		d.lastPersistedFileSize = info.Size()
+		d.lastPersistedFileModTime = info.ModTime()
+		d.hasPersistedFileMetadata = true
+		d.lastStateFileCheck = d.lastHeartbeat
+	} else {
+		d.hasPersistedFileMetadata = false
 	}
 	if d.stateWriteDeferred {
 		d.stateWriteDeferred = false
@@ -328,7 +456,11 @@ func (d *daemon) controllerRestartReady(ctx context.Context, now time.Time) bool
 			}
 		}
 	}
-	if !needsProbe || (!d.lastControllerProbe.IsZero() && now.Sub(d.lastControllerProbe) < 10*time.Second) {
+	probeInterval := recoveryControllerProbeInterval
+	if d.config.SharedAppServerEnabled && d.controllerState == "ready" {
+		probeInterval = readyControllerProbeInterval
+	}
+	if !needsProbe || (!d.lastControllerProbe.IsZero() && now.Sub(d.lastControllerProbe) < probeInterval) {
 		d.mu.Unlock()
 		return false
 	}
@@ -379,7 +511,8 @@ func (d *daemon) failOpenSharedBackend(ctx context.Context, reason string) strin
 	return "shared_app_server_disabled"
 }
 
-func (d *daemon) reopenRestartRequiredLocked(now time.Time) {
+func (d *daemon) reopenRestartRequiredLocked(now time.Time) bool {
+	changed := false
 	for threadID, thread := range d.state.Threads {
 		stopped := thread.Stopped
 		if stopped == nil || stopped.Reason != "codex_restart_required" {
@@ -401,23 +534,26 @@ func (d *daemon) reopenRestartRequiredLocked(now time.Time) {
 			ConsecutiveRetry: consecutive, MaxConsecutive: stopped.MaxConsecutive,
 		}
 		d.state.Threads[threadID] = thread
+		changed = true
 		d.logger.Printf("retry reopened thread=%s reason=codex_restart_completed", shortThreadID(threadID))
 	}
+	return changed
 }
 
-func (d *daemon) refreshControlsLocked(now time.Time) {
+func (d *daemon) refreshControlsLocked(now time.Time) bool {
 	control, err := loadOrCreateControlState(d.controlPath)
 	if err != nil {
 		d.lastError = err.Error()
 		d.logger.Printf("control state failed category=control_state")
-		return
+		return false
 	}
 	d.paused = control.Paused
+	d.monitoringPaused = control.MonitoringPaused
 	commands, invalid, err := loadControlCommandFiles(d.commandDir)
 	if err != nil {
 		d.lastError = err.Error()
 		d.logger.Printf("control commands failed category=control_commands")
-		return
+		return false
 	}
 	for _, path := range invalid {
 		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
@@ -432,9 +568,11 @@ func (d *daemon) refreshControlsLocked(now time.Time) {
 			d.logger.Printf("control command cleanup failed category=control_commands")
 		}
 	}
+	return len(commands) > 0
 }
 
-func (d *daemon) expireUnacknowledgedLocked(now time.Time) {
+func (d *daemon) expireUnacknowledgedLocked(now time.Time) bool {
+	changed := false
 	for threadID, thread := range d.state.Threads {
 		if thread.Awaiting == nil || thread.Awaiting.RetryTurnID != "" || thread.Awaiting.StartDeadline.After(now) {
 			continue
@@ -443,7 +581,9 @@ func (d *daemon) expireUnacknowledgedLocked(now time.Time) {
 			continue
 		}
 		d.rescheduleAwaitingLocked(threadID, thread, now, "start_not_acknowledged")
+		changed = true
 	}
+	return changed
 }
 
 const (
@@ -463,12 +603,13 @@ type awaitingLifecycleCandidate struct {
 // rollout file. An active turn remains untouched. A non-active result must be
 // observed twice, separated by a probe interval, before the retry is advanced;
 // this prevents a transient app-server status from creating a duplicate turn.
-func (d *daemon) reconcileAwaitingLifecycle(ctx context.Context, now time.Time) {
+func (d *daemon) reconcileAwaitingLifecycle(ctx context.Context, now time.Time) bool {
 	reader, ok := d.runner.(retryLifecycleReader)
 	if !ok {
-		return
+		return false
 	}
 
+	changed := false
 	d.mu.Lock()
 	candidates := make([]awaitingLifecycleCandidate, 0)
 	for threadID, thread := range d.state.Threads {
@@ -480,6 +621,18 @@ func (d *daemon) reconcileAwaitingLifecycle(ctx context.Context, now time.Time) 
 		if startedAt.IsZero() {
 			startedAt = awaiting.DispatchStartedAt
 		}
+		// A headless CLI resume is not owned by the Desktop IPC controller, so
+		// probing that controller would incorrectly stop a successfully started
+		// fallback. Rollout task_started/task_complete events remain authoritative.
+		// Bound a missing completion to avoid retaining stale state forever, but
+		// never redispatch automatically because the CLI process may still exist.
+		if awaiting.DispatchMode == "cli_fallback" {
+			if !startedAt.IsZero() && now.Sub(startedAt) >= maxAutomaticRecoveryDuration {
+				d.stopAwaitingForControllerLocked(threadID, thread, now, "cli_fallback_timeout")
+				changed = true
+			}
+			continue
+		}
 		if startedAt.IsZero() || now.Sub(startedAt) < time.Duration(d.config.StartAckTimeoutSeconds)*time.Second {
 			continue
 		}
@@ -489,6 +642,7 @@ func (d *daemon) reconcileAwaitingLifecycle(ctx context.Context, now time.Time) 
 		awaiting.LastLifecycleCheckAt = now
 		thread.Awaiting = awaiting
 		d.state.Threads[threadID] = thread
+		changed = true
 		candidates = append(candidates, awaitingLifecycleCandidate{
 			threadID: threadID, eventKey: awaiting.EventKey, turnID: awaiting.RetryTurnID,
 			codexHome: awaiting.CodexHome,
@@ -514,6 +668,7 @@ func (d *daemon) reconcileAwaitingLifecycle(ctx context.Context, now time.Time) 
 			nextFailures := awaiting.DispatchFailures + 1
 			if controllerFailureNeedsAction(reason) || nextFailures >= d.config.ControllerFailureLimit {
 				d.stopAwaitingForControllerLocked(candidate.threadID, thread, now, reason)
+				changed = true
 				d.mu.Unlock()
 				continue
 			}
@@ -546,8 +701,10 @@ func (d *daemon) reconcileAwaitingLifecycle(ctx context.Context, now time.Time) 
 			continue
 		}
 		d.advanceInactiveAwaitingLocked(candidate.threadID, thread, now, status)
+		changed = true
 		d.mu.Unlock()
 	}
+	return changed
 }
 
 func retryThreadIsActive(status string) bool {
@@ -610,7 +767,8 @@ func (d *daemon) advanceInactiveAwaitingLocked(threadID string, thread ThreadSta
 	thread.Pending = &PendingRetry{
 		EventKey: awaiting.EventKey, FailedTurnID: awaiting.FailedTurnID, FailedAt: awaiting.FailedAt,
 		OriginTurnStartedAt: awaiting.OriginTurnStartedAt, Class: awaiting.Class,
-		DueAt: now.Add(retryDelay(nextConsecutive, d.config)), CodexHome: awaiting.CodexHome, RolloutPath: awaiting.RolloutPath,
+		DueAt: now.Add(retryDelay(nextConsecutive, d.config)), WaitReason: awaiting.WaitReason,
+		CodexHome: awaiting.CodexHome, RolloutPath: awaiting.RolloutPath,
 		Attempt: nextAttempt, MaxAttempts: awaiting.MaxAttempts,
 		ConsecutiveRetry: nextConsecutive, MaxConsecutive: awaiting.MaxConsecutive,
 		DispatchFailures: awaiting.DispatchFailures, ParentNotified: awaiting.ParentNotified,
@@ -625,6 +783,10 @@ func (d *daemon) rescheduleAwaitingLocked(threadID string, thread ThreadState, n
 }
 
 func (d *daemon) rescheduleAwaitingWithPolicyLocked(threadID string, thread ThreadState, now time.Time, reason string, countFailure bool) {
+	d.rescheduleAwaitingAtLocked(threadID, thread, now, reason, time.Time{}, countFailure)
+}
+
+func (d *daemon) rescheduleAwaitingAtLocked(threadID string, thread ThreadState, now time.Time, reason string, retryAt time.Time, countFailure bool) {
 	awaiting := thread.Awaiting
 	if awaiting == nil {
 		return
@@ -642,6 +804,15 @@ func (d *daemon) rescheduleAwaitingWithPolicyLocked(threadID string, thread Thre
 		delayIndex = 1
 	}
 	delay := retryDelay(delayIndex, d.config)
+	dueAt := now.Add(delay)
+	if retryAt.After(now) {
+		dueAt = retryAt.UTC()
+		delay = dueAt.Sub(now)
+	}
+	waitReason := awaiting.WaitReason
+	if quotaReason := quotaWaitReason(reason); quotaReason != "" {
+		waitReason = quotaReason
+	}
 	thread.Awaiting = nil
 	thread.Pending = &PendingRetry{
 		EventKey:            awaiting.EventKey,
@@ -649,7 +820,8 @@ func (d *daemon) rescheduleAwaitingWithPolicyLocked(threadID string, thread Thre
 		FailedAt:            awaiting.FailedAt,
 		OriginTurnStartedAt: awaiting.OriginTurnStartedAt,
 		Class:               awaiting.Class,
-		DueAt:               now.Add(delay),
+		DueAt:               dueAt,
+		WaitReason:          waitReason,
 		CodexHome:           awaiting.CodexHome,
 		RolloutPath:         awaiting.RolloutPath,
 		Attempt:             awaiting.Attempt,
@@ -719,6 +891,17 @@ func controllerFailureNeedsAction(reason string) bool {
 	}
 }
 
+func isQuotaWaitReason(reason string) bool {
+	return reason == "quota_limited" || reason == "quota_status_unavailable"
+}
+
+func quotaWaitReason(reason string) string {
+	if isQuotaWaitReason(reason) {
+		return reason
+	}
+	return ""
+}
+
 func controllerFailureNeedsFailOpen(reason string) bool {
 	switch reason {
 	case "shared_app_server_port_reserved", "shared_app_server_port_conflict", "shared_app_server_environment_conflict", "shared_app_server_ownership_unknown",
@@ -774,8 +957,9 @@ func (d *daemon) dispatchDueLocked(now time.Time) []RetryJob {
 	if d.paused {
 		return jobs
 	}
-	if !d.config.SharedAppServerEnabled || d.controllerState == "shared_app_server_disabled" ||
-		d.controllerState == "shared_app_server_config_invalid" {
+	primaryRecoveryUnavailable := !d.config.SharedAppServerEnabled || d.controllerState == "shared_app_server_disabled" ||
+		d.controllerState == "shared_app_server_config_invalid"
+	if primaryRecoveryUnavailable && !d.config.CLIResumeFallbackEnabled {
 		// The fail-open mode deliberately has no recovery transport. Do not
 		// promote a due item to AwaitingRetry: doing so looks like a retry was
 		// started and then failed, even though Codex never received a request.
@@ -796,6 +980,20 @@ func (d *daemon) dispatchDueLocked(now time.Time) []RetryJob {
 		pending  PendingRetry
 	}
 	candidates := make([]candidate, 0)
+	plan, planErr := loadTaskPlan(filepath.Join(d.dataDir, "task-plan.json"))
+	if planErr != nil {
+		// A damaged plan must never widen an explicit user selection back to
+		// the legacy auto-resume-all behaviour.
+		if !d.taskPlanErrorLogged && d.logger != nil {
+			d.logger.Printf("task plan unavailable; quota dispatch paused category=task_plan")
+		}
+		d.taskPlanErrorLogged = true
+		d.lastError = "task_plan_unavailable"
+	} else {
+		d.taskPlanErrorLogged = false
+		d.adoptSequentialRunningLocked(plan)
+		d.reconcileQuotaOwnerLocked(plan, now)
+	}
 	for threadID, thread := range d.state.Threads {
 		if thread.GoalHeld && !goalLimitRestartPending(thread) && !heldConversationStillAllowed(thread, thread.GoalStatus, thread.GoalUpdatedAt) {
 			if thread.Pending != nil || thread.Awaiting != nil {
@@ -812,6 +1010,14 @@ func (d *daemon) dispatchDueLocked(now time.Time) []RetryJob {
 		if thread.Pending == nil || thread.Pending.DueAt.After(now) || thread.Awaiting != nil {
 			continue
 		}
+		if thread.Pending.Class == classRateLimit && (planErr != nil || (plan.Configured && !plan.IsSelected(threadID))) {
+			continue
+		}
+		if thread.Pending.Class == classRateLimit && thread.ObservedTurnRunning {
+			// An observed active turn must finish or abort before this exact
+			// thread can receive another automatic continuation.
+			continue
+		}
 		if _, active := d.active[threadID]; active {
 			continue
 		}
@@ -821,12 +1027,39 @@ func (d *daemon) dispatchDueLocked(now time.Time) []RetryJob {
 		return jobs
 	}
 	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].pending.Class == classRateLimit && candidates[j].pending.Class == classRateLimit && plan.Configured {
+			left, right := plan.Order(candidates[i].threadID), plan.Order(candidates[j].threadID)
+			if left != right {
+				return left < right
+			}
+		}
+		if candidates[i].pending.DueAt.Equal(candidates[j].pending.DueAt) {
+			return candidates[i].threadID < candidates[j].threadID
+		}
 		return candidates[i].pending.DueAt.Before(candidates[j].pending.DueAt)
 	})
-	if available > len(candidates) {
-		available = len(candidates)
+	resumeInterval := time.Duration(d.config.ResumeIntervalSeconds) * time.Second
+	if resumeInterval > 0 && !d.state.LastResumeDispatchAt.IsZero() && now.Before(d.state.LastResumeDispatchAt.Add(resumeInterval)) {
+		return jobs
 	}
-	for _, item := range candidates[:available] {
+	// Spacing limits only when requests start, not how long they may run. One
+	// task can remain active while another starts on a later scheduler tick.
+	if resumeInterval > 0 && available > 1 {
+		available = 1
+	}
+	for _, item := range candidates {
+		if available == 0 {
+			break
+		}
+		if item.pending.Class == classRateLimit {
+			if d.config.QuotaResumeMode == quotaModeSequentialCompletion &&
+				d.state.QuotaSchedulerOwnerID != "" && d.state.QuotaSchedulerOwnerID != item.threadID {
+				continue
+			}
+			if !d.quotaCapacityReadyLocked(now) {
+				continue
+			}
+		}
 		thread := d.state.Threads[item.threadID]
 		thread.Pending = nil
 		thread.LastAutoRetryAt = now
@@ -837,6 +1070,7 @@ func (d *daemon) dispatchDueLocked(now time.Time) []RetryJob {
 			OriginTurnStartedAt: item.pending.OriginTurnStartedAt,
 			Class:               item.pending.Class,
 			Action:              actionDispatching,
+			WaitReason:          item.pending.WaitReason,
 			Attempt:             item.pending.Attempt,
 			MaxAttempts:         item.pending.MaxAttempts,
 			ConsecutiveRetry:    item.pending.ConsecutiveRetry,
@@ -868,9 +1102,15 @@ func (d *daemon) dispatchDueLocked(now time.Time) []RetryJob {
 			ParentNotified:      item.pending.ParentNotified,
 			GoalLimitRestart:    item.pending.GoalLimitRestart,
 			RecoveryEventID:     recoveryEventID(item.threadID, item.pending.EventKey),
+			WaitReason:          item.pending.WaitReason,
 		}
 		d.active[item.threadID] = job
 		jobs = append(jobs, job)
+		d.state.LastResumeDispatchAt = now
+		if item.pending.Class == classRateLimit {
+			d.quotaDispatchStartedLocked(item.threadID)
+		}
+		available--
 	}
 	return jobs
 }
@@ -913,7 +1153,10 @@ func (d *daemon) runJob(ctx context.Context, job RetryJob) {
 	if result.ParentNotified {
 		thread.Awaiting.ParentNotified = true
 	}
-	if err != nil || result.Outcome == outcomeRetryLater {
+	if result.Outcome == outcomeRetryLater && isQuotaWaitReason(result.Reason) && err == nil {
+		d.controllerState = "ready"
+		d.rescheduleAwaitingAtLocked(job.ThreadID, thread, finishedAt, result.Reason, result.RetryAt, false)
+	} else if err != nil || result.Outcome == outcomeRetryLater {
 		reason := controllerFailureReason(result, err)
 		d.controllerState = reason
 		d.rescheduleAwaitingWithPolicyLocked(job.ThreadID, thread, finishedAt, reason, true)
@@ -926,6 +1169,7 @@ func (d *daemon) runJob(ctx context.Context, job RetryJob) {
 		d.rescheduleAwaitingWithPolicyLocked(job.ThreadID, thread, finishedAt, controllerFailureReason(result, nil), false)
 	} else if result.Outcome == outcomeNotApplicable {
 		d.controllerState = "ready"
+		thread.LastTerminalNoRetryAt = finishedAt
 		thread.RecoveryAttempts = 0
 		thread.ConsecutiveRetries = 0
 		thread.CurrentTurnProgress = false
@@ -938,12 +1182,31 @@ func (d *daemon) runJob(ctx context.Context, job RetryJob) {
 			if status != "" {
 				thread.GoalStatus = status
 			}
+			if status == "completed" {
+				// The controller observed the official goal result directly.
+				thread.GoalObservedAt = finishedAt
+			}
 		}
 		d.state.Threads[job.ThreadID] = thread
 		d.logger.Printf("retry skipped thread=%s reason=%s", shortThreadID(job.ThreadID), result.Reason)
 	} else {
 		d.controllerState = "ready"
+		if isQuotaWaitReason(job.WaitReason) {
+			// A reset deadline is only a wake-up time. Reaching this branch means
+			// a fresh quota read allowed the dispatch and Codex accepted it, so a
+			// later quota cycle starts with a fresh recovery budget.
+			thread.RecoveryAttempts = 1
+			thread.ConsecutiveRetries = 1
+			thread.RecoveryStartedAt = finishedAt
+			thread.Awaiting.Attempt = 1
+			thread.Awaiting.ConsecutiveRetry = 1
+			thread.Awaiting.WaitReason = ""
+		}
 		thread.Awaiting.Action = result.Action
+		thread.Awaiting.DispatchMode = ""
+		if result.Reason == "cli_fallback_started" {
+			thread.Awaiting.DispatchMode = "cli_fallback"
+		}
 		thread.Awaiting.DispatchFailures = 0
 		thread.Awaiting.StartDeadline = finishedAt.Add(time.Duration(d.config.StartAckTimeoutSeconds) * time.Second)
 		d.state.Threads[job.ThreadID] = thread
@@ -980,9 +1243,9 @@ func (d *daemon) writeStatusLocked(running bool, rootCount int) error {
 		pending = 0
 		active = 0
 	}
-	capability := capabilityForControllerState(d.controllerState, d.config.SharedAppServerEnabled)
+	capability := capabilityForControllerState(d.controllerState, d.config.SharedAppServerEnabled, d.config.CLIResumeFallbackEnabled)
 	if !running {
-		capability = capabilityForControllerState("codex_not_running", false)
+		capability = capabilityForControllerState("codex_not_running", false, d.config.CLIResumeFallbackEnabled)
 	}
 	status := StatusSnapshot{
 		BuildSourceHash:                     buildSourceHash,
@@ -992,14 +1255,17 @@ func (d *daemon) writeStatusLocked(running bool, rootCount int) error {
 		AutomaticRecoverySupported:          capability.Automatic,
 		RecoveryCapabilityReason:            capability.Reason,
 		Version:                             appVersion,
+		Build:                               appBuild,
 		Running:                             running,
 		PID:                                 os.Getpid(),
 		StartedAt:                           d.startedAt,
+		LastHeartbeatAt:                     d.lastHeartbeat,
 		LastScanAt:                          d.lastScan,
 		WatchedRoots:                        rootCount,
 		PendingRetries:                      pending,
 		ActiveRetries:                       active,
 		Paused:                              d.paused,
+		MonitoringPaused:                    d.monitoringPaused,
 		SharedAppServerEnabled:              d.config.SharedAppServerEnabled,
 		SharedAppServerRequested:            d.config.SharedAppServerRequested,
 		ControllerState:                     d.controllerState,
@@ -1013,6 +1279,20 @@ func (d *daemon) writeStatusLocked(running bool, rootCount int) error {
 		RetrySafetyWarning:                  d.config.retrySafetyWarning(),
 		LogPath:                             d.logger.path,
 	}
+	// Publish a changed operational state immediately, but do not replace the
+	// status file every scheduler tick solely to advance its heartbeat.
+	comparable := status
+	comparable.LastHeartbeatAt = time.Time{}
+	// Memory samples are telemetry, not a state transition. They are included
+	// in the next bounded heartbeat write rather than forcing disk churn.
+	comparable.MemoryUsageMB = 0
+	comparable.SharedAppServerMemoryUsageMB = 0
+	if !d.statusWriteDeferred && !d.lastStatusPersist.IsZero() &&
+		status.LastHeartbeatAt.Sub(d.lastStatusPersist) >= 0 &&
+		status.LastHeartbeatAt.Sub(d.lastStatusPersist) < statusHeartbeatInterval &&
+		comparable == d.lastPublishedStatus {
+		return nil
+	}
 	writer := d.writeStatusFile
 	if writer == nil {
 		writer = writeJSONAtomic
@@ -1021,6 +1301,8 @@ func (d *daemon) writeStatusLocked(running bool, rootCount int) error {
 		d.statusWriteDeferred = true
 		return err
 	}
+	d.lastStatusPersist = status.LastHeartbeatAt
+	d.lastPublishedStatus = comparable
 	if d.statusWriteDeferred {
 		d.statusWriteDeferred = false
 		d.logger.Printf("status save recovered category=status_write")

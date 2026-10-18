@@ -14,14 +14,20 @@ const (
 )
 
 func writeJSONAtomic(path string, value any) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
+	return writeBytesAtomic(path, data)
+}
+
+// writeBytesAtomic shares the same durable replacement path with JSON writers.
+// Callers that already encoded their payload need not marshal it a second time.
+func writeBytesAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	temp, err := os.CreateTemp(filepath.Dir(path), ".codex-auto-retry-*.tmp")
 	if err != nil {
 		return err

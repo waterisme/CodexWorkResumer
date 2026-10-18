@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [string]$OutputDirectory = (Join-Path $env:USERPROFILE 'releases\codex-auto-retry'),
+    [string]$OutputDirectory = (Join-Path $env:USERPROFILE 'releases\CodexWorkResumer'),
     [switch]$SkipBuild
 )
 
@@ -8,15 +8,16 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 
 $pluginRoot = Split-Path -Parent $PSScriptRoot
+$verifiedVersion = & (Join-Path $PSScriptRoot 'verify-version.ps1') -Root $pluginRoot
 $releaseTemplate = Join-Path $pluginRoot 'release\windows'
 . (Join-Path $releaseTemplate 'common.ps1')
-$installLauncher = ([string][char]0x5b89) + ([char]0x88c5) + '.cmd'
-$uninstallLauncher = ([string][char]0x5378) + ([char]0x8f7d) + '.cmd'
-$installReadme = 'README-' + ([char]0x5b89) + ([char]0x88c5) + ([char]0x8bf4) + ([char]0x660e) + '.txt'
-$startupManagerLauncher = ([string][char]0x542f) + ([char]0x52a8) + ([char]0x7ba1) + ([char]0x7406) + ([char]0x5668) + '.cmd'
+$installLauncher = ([string][char]0x5b89) + ([char]0x88dd) + '.cmd'
+$uninstallLauncher = ([string][char]0x5378) + ([char]0x8f09) + '.cmd'
+$installReadme = 'README-' + ([char]0x5b89) + ([char]0x88dd) + ([char]0x8aaa) + ([char]0x660e) + '.txt'
+$startupManagerLauncher = ([string][char]0x555f) + ([char]0x52d5) + ([char]0x7ba1) + ([char]0x7406) + ([char]0x5668) + '.cmd'
 $safeDisableLauncher = ([string][char]0x5b89) + ([char]0x5168) + ([char]0x505c) + ([char]0x7528) + '.cmd'
 $startupManagerVbs = 'startup-manager.vbs'
-$safeCodexLauncher = ([string][char]0x5b89) + ([char]0x5168) + ([char]0x542f) + ([char]0x52a8) + 'Codex.vbs'
+$safeCodexLauncher = ([string][char]0x5b89) + ([char]0x5168) + ([char]0x555f) + ([char]0x52d5) + 'Codex.vbs'
 
 $pluginManifestPath = Join-Path $pluginRoot '.codex-plugin\plugin.json'
 $pluginManifest = Read-JsonDocument -Path $pluginManifestPath
@@ -24,13 +25,24 @@ if ($null -eq $pluginManifest -or [string]$pluginManifest.name -ne 'codex-auto-r
     throw 'The Codex Auto Retry plugin manifest is missing or invalid.'
 }
 $pluginVersion = [string]$pluginManifest.version
-$packageVersion = ($pluginVersion -split '\+', 2)[0]
+$versionRecord = Read-JsonDocument -Path (Join-Path $pluginRoot 'VERSION.json')
+if ($null -eq $versionRecord -or [int]$versionRecord.schema -ne 1 -or
+    [string]$versionRecord.version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
+    [int]$versionRecord.build -lt 1) {
+    throw 'VERSION.json is missing or invalid.'
+}
+$packageVersion = [string]$versionRecord.version
+$buildNumber = [int]$versionRecord.build
 if ($packageVersion -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
     throw "The plugin version is not suitable for a release package: $pluginVersion"
 }
+if ($pluginVersion -ne ($packageVersion + '+build.' + $buildNumber)) {
+    throw 'The plugin version must match VERSION.json as version+build.N.'
+}
 
 $versionSource = Get-Content -LiteralPath (Join-Path $pluginRoot 'scripts\source\model.go') -Raw -Encoding UTF8
-if ($versionSource -notmatch 'const\s+appVersion\s*=\s*"([^"]+)"' -or $matches[1] -ne $packageVersion) {
+if ($versionSource -notmatch 'appVersion\s*=\s*"([^"]+)"' -or $matches[1] -ne $packageVersion -or
+    $versionSource -notmatch 'appBuild\s*=\s*(\d+)' -or [int]$matches[1] -ne $buildNumber) {
     throw 'The watchdog appVersion and plugin base version do not match.'
 }
 
@@ -54,7 +66,7 @@ Assert-X64PeBinary -Path $mcp
 
 $outputPath = Get-FullPath $OutputDirectory
 New-Item -ItemType Directory -Force -Path $outputPath | Out-Null
-$packageName = "Codex-Auto-Retry-$packageVersion-windows-x64"
+$packageName = "CodexWorkResumer-v$packageVersion-b$buildNumber-windows-x64"
 $archivePath = Join-Path $outputPath ($packageName + '.zip')
 $archiveHashPath = $archivePath + '.sha256.txt'
 $stageParent = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-auto-retry-release-' + [guid]::NewGuid().ToString('N'))
@@ -70,10 +82,32 @@ try {
 
     $payloadRoot = Join-Path $packageRoot 'payload\codex-auto-retry'
     New-Item -ItemType Directory -Force -Path $payloadRoot | Out-Null
-    foreach ($entry in @('.codex-plugin', '.gitattributes', '.gitignore', '.mcp.json', 'assets', 'docs', 'release', 'skills', 'scripts', 'LICENSE', 'README.md', 'THIRD_PARTY_NOTICES.md')) {
+    # Installation does not need documentation screenshots or editable documents.
+    # Keep these out of the installer even when old local copies remain on disk.
+    foreach ($entry in @('.codex-plugin', '.gitattributes', '.gitignore', '.mcp.json', 'release', 'skills', 'scripts', 'LICENSE', 'README.md', 'README_zh-TW.md', 'THIRD_PARTY_NOTICES.md', 'THIRD_PARTY_LICENSES.txt', 'VERSION.json', 'CHANGELOG.md')) {
         $source = Join-Path $pluginRoot $entry
         if (-not (Test-Path -LiteralPath $source)) { throw "Plugin payload entry is missing: $entry" }
-        Copy-Item -LiteralPath $source -Destination (Join-Path $payloadRoot $entry) -Recurse -Force
+        if ($entry -ne 'scripts') {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $payloadRoot $entry) -Recurse -Force
+            continue
+        }
+        # npm ci creates very deep paths on Windows. Never stage node_modules:
+        # copying it first can hit MAX_PATH before the cleanup below runs.
+        $stagedScripts = Join-Path $payloadRoot 'scripts'
+        $stagedSource = Join-Path $stagedScripts 'source'
+        $stagedUi = Join-Path $stagedSource 'ui'
+        New-Item -ItemType Directory -Force -Path $stagedUi | Out-Null
+        foreach ($item in (Get-ChildItem -LiteralPath $source -Force | Where-Object Name -ne 'source')) {
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $stagedScripts $item.Name) -Recurse -Force
+        }
+        $sourceTree = Join-Path $source 'source'
+        foreach ($item in (Get-ChildItem -LiteralPath $sourceTree -Force | Where-Object { $_.Name -ne 'ui' -and $_.Name -ne '.go-test-tmp' })) {
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $stagedSource $item.Name) -Recurse -Force
+        }
+        $uiTree = Join-Path $sourceTree 'ui'
+        foreach ($item in (Get-ChildItem -LiteralPath $uiTree -Force | Where-Object Name -ne 'node_modules')) {
+            Copy-Item -LiteralPath $item.FullName -Destination (Join-Path $stagedUi $item.Name) -Recurse -Force
+        }
     }
 
     $nodeModules = Join-Path $payloadRoot 'scripts\source\ui\node_modules'
@@ -83,17 +117,6 @@ try {
             throw 'The staged node_modules path is a link and cannot be safely removed.'
         }
         Remove-Item -LiteralPath $nodeModules -Recurse -Force
-    }
-
-    $sourceBin = Join-Path $pluginRoot 'scripts\bin'
-    $unexpectedSourceBinFiles = @(Get-ChildItem -LiteralPath $sourceBin -File -Recurse -Force |
-        Where-Object {
-            $_.DirectoryName -ne $sourceBin -or
-            @('codex-auto-retry.exe', 'codex-auto-retry-mcp.exe') -notcontains $_.Name
-        })
-    if ($unexpectedSourceBinFiles.Count -gt 0) {
-        $names = ($unexpectedSourceBinFiles.FullName | Sort-Object) -join ', '
-        throw "Refusing to package runtime state from scripts/bin: $names"
     }
 
     $stagedBin = Join-Path $payloadRoot 'scripts\bin'
@@ -106,8 +129,9 @@ try {
 
     $releaseManifest = [pscustomobject][ordered]@{
         schemaVersion = 1
-        product = 'Codex Auto Retry'
+        product = 'CodexWorkResumer'
         packageVersion = $packageVersion
+        buildNumber = $buildNumber
         pluginName = 'codex-auto-retry'
         pluginVersion = $pluginVersion
         target = 'windows-x64'
@@ -137,7 +161,13 @@ try {
     Remove-Item -LiteralPath $archivePath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $archiveHashPath -Force -ErrorAction SilentlyContinue
     Write-Host '[Release] Compressing archive...'
-    Compress-Archive -LiteralPath $packageRoot -DestinationPath $archivePath -CompressionLevel Optimal -Force
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+        $stageParent,
+        $archivePath,
+        [System.IO.Compression.CompressionLevel]::Optimal,
+        $false
+    )
 
     $archiveHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     [System.IO.File]::WriteAllText(

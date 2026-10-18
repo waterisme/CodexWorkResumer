@@ -37,6 +37,13 @@ func classifyFailure(errorText string, cfg Config) RetryDecision {
 	) {
 		return RetryDecision{Class: classNone, Reason: "permanent request or policy error"}
 	}
+	if containsAny(text,
+		"usage_limit_exceeded", "usagelimitexceeded", "usage limit",
+		"rate_limit_exceeded", "ratelimitexceeded",
+		"session_budget_exceeded", "sessionbudgetexceeded",
+	) {
+		return RetryDecision{Retry: true, Class: classRateLimit, Reason: "usage or rate limit"}
+	}
 
 	status := extractStatus(text)
 	switch {

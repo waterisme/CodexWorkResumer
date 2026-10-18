@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,6 +69,7 @@ func (r *cleanupRunner) ReconcileSharedBackendCleanup(context.Context) error {
 type lifecycleRunner struct {
 	*fakeResumeRunner
 	mu       sync.Mutex
+	calls    int
 	statuses []string
 	errs     []error
 }
@@ -75,6 +77,7 @@ type lifecycleRunner struct {
 func (r *lifecycleRunner) RetryThreadStatus(context.Context, string, string) (string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.calls++
 	if len(r.errs) > 0 {
 		err := r.errs[0]
 		r.errs = r.errs[1:]
@@ -88,6 +91,12 @@ func (r *lifecycleRunner) RetryThreadStatus(context.Context, string, string) (st
 	status := r.statuses[0]
 	r.statuses = r.statuses[1:]
 	return status, nil
+}
+
+func (r *lifecycleRunner) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
 }
 
 func (f *fakeResumeRunner) Resume(ctx context.Context, job RetryJob) (DispatchResult, error) {
@@ -224,8 +233,28 @@ func TestSharedBackendReadinessIsSupervisedWhileReady(t *testing.T) {
 	if d.controllerRestartReady(context.Background(), now.Add(5*time.Second)) {
 		t.Fatal("shared backend health check ignored the probe interval")
 	}
+	if d.controllerRestartReady(context.Background(), now.Add(11*time.Second)) {
+		t.Fatal("healthy shared backend was probed before the 30s interval")
+	}
+	if !d.controllerRestartReady(context.Background(), now.Add(31*time.Second)) {
+		t.Fatal("shared backend was not rechecked after the 30s interval")
+	}
+}
+
+func TestSharedBackendFailureUsesShorterProbeInterval(t *testing.T) {
+	now := time.Now().UTC()
+	runner := &stateAwareRunner{fakeResumeRunner: successfulRunner(), state: "ready"}
+	d := newTestDaemon(t, isolatedConfig(t.TempDir()), runner)
+	d.controllerState = "ready"
+	if !d.controllerRestartReady(context.Background(), now) {
+		t.Fatal("initial healthy probe was skipped")
+	}
+	d.controllerState = "codex_restart_required"
+	if d.controllerRestartReady(context.Background(), now.Add(5*time.Second)) {
+		t.Fatal("recovery probe ran before the 10s interval")
+	}
 	if !d.controllerRestartReady(context.Background(), now.Add(11*time.Second)) {
-		t.Fatal("shared backend was not rechecked after the probe interval")
+		t.Fatal("recovery probe was delayed by the healthy interval")
 	}
 }
 
@@ -453,6 +482,7 @@ func isolatedConfig(codexHome string) Config {
 	cfg.IncludeDefaultHome = false
 	cfg.IncludeCockpitHomes = false
 	cfg.InitialDelaySeconds = 1
+	cfg.ScanIntervalSeconds = 1
 	cfg.MaxDelaySeconds = 10
 	cfg.StartAckTimeoutSeconds = 10
 	// Daemon retry tests use an in-memory runner as the recovery transport.
@@ -477,10 +507,31 @@ func newTestDaemon(t *testing.T, cfg Config, runner resumeRunner) *daemon {
 	return d
 }
 
+func TestMonitoringPauseKeepsHeartbeatWithoutScanning(t *testing.T) {
+	d := newTestDaemon(t, isolatedConfig(t.TempDir()), successfulRunner())
+	now := time.Date(2026, 9, 21, 9, 0, 0, 0, time.UTC)
+	if _, err := saveMonitoringPaused(d.controlPath, true, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.tick(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if !d.monitoringPaused || !d.lastScan.IsZero() || !d.lastHeartbeat.Equal(now) {
+		t.Fatalf("monitoring pause did not preserve heartbeat-only mode: paused=%v scan=%v heartbeat=%v", d.monitoringPaused, d.lastScan, d.lastHeartbeat)
+	}
+	status, found, err := loadStatusSnapshot(d.statusPath)
+	if err != nil || !found {
+		t.Fatalf("paused status unavailable: found=%v err=%v", found, err)
+	}
+	if !status.Running || !status.MonitoringPaused || !status.LastHeartbeatAt.Equal(now) || !status.LastScanAt.IsZero() {
+		t.Fatalf("unexpected paused status: %+v", status)
+	}
+}
+
 func TestStateWriteFailureDoesNotStopWatchdog(t *testing.T) {
 	d := newTestDaemon(t, isolatedConfig(t.TempDir()), successfulRunner())
 	writes := 0
-	d.writeState = func(string, any) error {
+	d.writeState = func(string, []byte) error {
 		writes++
 		if writes == 1 {
 			return errors.New("sharing violation")
@@ -499,6 +550,167 @@ func TestStateWriteFailureDoesNotStopWatchdog(t *testing.T) {
 	}
 	if writes != 2 || d.lastError != "" {
 		t.Fatalf("state persistence did not recover on the next tick: writes=%d last_error=%q", writes, d.lastError)
+	}
+}
+
+func TestIdleStateDoesNotRewriteOnHeartbeatOrPruneCheck(t *testing.T) {
+	cfg := isolatedConfig(t.TempDir())
+	cfg.AutoScanEnabled = false
+	d := newTestDaemon(t, cfg, successfulRunner())
+	writes := 0
+	d.writeState = func(path string, data []byte) error {
+		writes++
+		return writeBytesAtomic(path, data)
+	}
+	now := time.Now().UTC()
+	for _, offset := range []time.Duration{0, 2 * time.Second, 12 * time.Second, 61 * time.Second} {
+		if err := d.tick(context.Background(), now.Add(offset)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if writes != 1 {
+		t.Fatalf("unchanged state was rewritten during idle heartbeat/prune checks: %d", writes)
+	}
+}
+
+func TestMissingStateFileIsRebuiltAtNextRecheck(t *testing.T) {
+	cfg := isolatedConfig(t.TempDir())
+	cfg.AutoScanEnabled = false
+	d := newTestDaemon(t, cfg, successfulRunner())
+	now := time.Now().UTC()
+	if err := d.tick(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(d.statePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.tick(context.Background(), now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(d.statePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state file unexpectedly rebuilt before idle recheck: %v", err)
+	}
+	if err := d.tick(context.Background(), now.Add(stateFileCheckInterval+time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(d.statePath); err != nil {
+		t.Fatalf("missing state file was not repaired at next recheck: %v", err)
+	}
+}
+
+func TestActiveStateRecheckPersistsChangesWithoutScan(t *testing.T) {
+	cfg := isolatedConfig(t.TempDir())
+	cfg.AutoScanEnabled = false
+	d := newTestDaemon(t, cfg, successfulRunner())
+	writes := 0
+	d.writeState = func(path string, data []byte) error {
+		writes++
+		return writeBytesAtomic(path, data)
+	}
+	now := time.Now().UTC()
+	if err := d.tick(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	id := "019f9d5d-9c82-75b1-b7c0-20a658af0441"
+	d.state.Threads[id] = ThreadState{Pending: &PendingRetry{
+		EventKey: "event", FailedTurnID: "failed-turn", Class: classServer,
+		DueAt: now.Add(time.Hour), Attempt: 1, MaxAttempts: 15,
+	}}
+	if err := d.tick(context.Background(), now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("active state was written before its recheck interval: %d", writes)
+	}
+	if err := d.tick(context.Background(), now.Add(11*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 2 {
+		t.Fatalf("active state change was not persisted within 10 seconds: %d", writes)
+	}
+	if err := d.tick(context.Background(), now.Add(21*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 2 {
+		t.Fatalf("unchanged active state was rewritten: %d", writes)
+	}
+}
+
+func TestControlCommandPersistsStateOnNextTick(t *testing.T) {
+	cfg := isolatedConfig(t.TempDir())
+	cfg.AutoScanEnabled = false
+	d := newTestDaemon(t, cfg, successfulRunner())
+	writes := 0
+	d.writeState = func(path string, data []byte) error {
+		writes++
+		return writeBytesAtomic(path, data)
+	}
+	now := time.Now().UTC()
+	id := "019f9d5d-9c82-75b1-b7c0-20a658af0442"
+	d.state.Threads[id] = ThreadState{Pending: &PendingRetry{
+		EventKey: "event", FailedTurnID: "failed-turn", Class: classServer,
+		DueAt: now.Add(time.Hour), Attempt: 1, MaxAttempts: 15,
+	}}
+	if err := d.tick(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queueControlCommand(d.commandDir, commandCancelRetry, id, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.tick(context.Background(), now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 2 || d.state.Threads[id].Pending != nil {
+		t.Fatalf("cancel command was not persisted immediately: writes=%d thread=%+v", writes, d.state.Threads[id])
+	}
+}
+
+func TestStatePruneRunsOncePerMinute(t *testing.T) {
+	cfg := isolatedConfig(t.TempDir())
+	cfg.AutoScanEnabled = false
+	d := newTestDaemon(t, cfg, successfulRunner())
+	now := time.Now().UTC()
+	if err := d.tick(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	d.state.ProcessedEvents["old"] = now.Add(-15 * 24 * time.Hour)
+	if err := d.tick(context.Background(), now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := d.state.ProcessedEvents["old"]; !found {
+		t.Fatal("historical pruning ran on the 2-second scheduler tick")
+	}
+	if err := d.tick(context.Background(), now.Add(61*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := d.state.ProcessedEvents["old"]; found {
+		t.Fatal("expired marker survived the minute prune")
+	}
+}
+
+func TestProtectedThreadOverflowDoesNotPruneEveryTick(t *testing.T) {
+	cfg := isolatedConfig(t.TempDir())
+	cfg.AutoScanEnabled = false
+	d := newTestDaemon(t, cfg, successfulRunner())
+	now := time.Now().UTC()
+	for i := 0; i <= maxThreadEntries; i++ {
+		d.state.Threads[fmt.Sprintf("protected-%d", i)] = ThreadState{Pending: &PendingRetry{
+			EventKey: fmt.Sprintf("event-%d", i), FailedTurnID: "failed-turn", Class: classServer,
+			DueAt: now.Add(time.Hour), Attempt: 1, MaxAttempts: 15,
+		}}
+	}
+	if err := d.tick(context.Background(), now); err != nil {
+		t.Fatal(err)
+	}
+	firstPrune := d.lastStatePrune
+	if err := d.tick(context.Background(), now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if !d.lastStatePrune.Equal(firstPrune) {
+		t.Fatal("protected thread overflow forced a full prune on a 2-second tick")
+	}
+	if len(d.state.Threads) != maxThreadEntries+1 {
+		t.Fatal("prune removed a pending retry thread")
 	}
 }
 
@@ -546,6 +758,28 @@ func TestDisabledSharedBackendDoesNotStartDueRetry(t *testing.T) {
 	}
 }
 
+func TestOptInCLIFallbackAllowsDueRetryWithoutSharedBackend(t *testing.T) {
+	cfg := isolatedConfig(t.TempDir())
+	cfg.CLIResumeFallbackEnabled = true
+	d := newTestDaemon(t, cfg, successfulRunner())
+	d.controllerState = "shared_app_server_disabled"
+	threadID := "019f9d5d-9c82-75b1-b7c0-20a658af0429"
+	now := time.Now().UTC()
+	d.state.Threads[threadID] = ThreadState{Pending: &PendingRetry{
+		EventKey: "cli-pending-event", FailedTurnID: "failed-turn", Class: classTransient,
+		DueAt: now, Attempt: 1, MaxAttempts: 1000, ConsecutiveRetry: 1, MaxConsecutive: 100,
+	}}
+
+	jobs := d.dispatchDueLocked(now)
+	if len(jobs) != 1 || jobs[0].ThreadID != threadID {
+		t.Fatalf("opt-in CLI fallback did not receive the due retry: %+v", jobs)
+	}
+	thread := daemonThreadSnapshot(d, threadID)
+	if thread.Pending != nil || thread.Awaiting == nil || thread.Stopped != nil {
+		t.Fatalf("opt-in CLI fallback was stopped before dispatch: %+v", thread)
+	}
+}
+
 func TestStatusWriteFailureDoesNotStopWatchdog(t *testing.T) {
 	d := newTestDaemon(t, isolatedConfig(t.TempDir()), successfulRunner())
 	writes := 0
@@ -568,6 +802,48 @@ func TestStatusWriteFailureDoesNotStopWatchdog(t *testing.T) {
 	}
 	if writes != 2 || d.statusWriteDeferred {
 		t.Fatalf("status persistence did not recover on the next tick: writes=%d deferred=%v", writes, d.statusWriteDeferred)
+	}
+}
+
+func TestStatusHeartbeatWritesLessOftenButChangesImmediately(t *testing.T) {
+	d := newTestDaemon(t, isolatedConfig(t.TempDir()), successfulRunner())
+	writes := 0
+	d.writeStatusFile = func(string, any) error {
+		writes++
+		return nil
+	}
+	now := time.Now().UTC()
+	d.lastHeartbeat = now
+	if err := d.writeStatus(true); err != nil {
+		t.Fatal(err)
+	}
+	d.lastHeartbeat = now.Add(2 * time.Second)
+	if err := d.writeStatus(true); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("unchanged status wrote before heartbeat interval: %d", writes)
+	}
+	d.memoryUsageBytes = 64 * 1024 * 1024
+	if err := d.writeStatus(true); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 1 {
+		t.Fatalf("memory telemetry forced an early status write: %d", writes)
+	}
+	d.paused = true
+	if err := d.writeStatus(true); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 2 {
+		t.Fatalf("pause state was not published immediately: %d", writes)
+	}
+	d.lastHeartbeat = now.Add(2*time.Second + statusHeartbeatInterval)
+	if err := d.writeStatus(true); err != nil {
+		t.Fatal(err)
+	}
+	if writes != 3 {
+		t.Fatalf("heartbeat was not refreshed after interval: %d", writes)
 	}
 }
 
@@ -1306,6 +1582,35 @@ func TestActiveAcknowledgedRetrySurvivesLifecycleProbe(t *testing.T) {
 	}
 }
 
+func TestCLIFallbackAwaitingSkipsDesktopLifecycleProbeAndStopsAtBound(t *testing.T) {
+	threadID := "019fa17c-1e5f-7dc3-bae5-e84666ffc20a"
+	runner := &lifecycleRunner{fakeResumeRunner: successfulRunner(), statuses: []string{"idle"}}
+	d := newTestDaemon(t, isolatedConfig(t.TempDir()), runner)
+	now := time.Now().UTC()
+	d.state.Threads[threadID] = ThreadState{Awaiting: &AwaitingRetry{
+		EventKey: "event", FailedTurnID: "failed", RetryTurnID: "retry-turn", Class: classServer,
+		DispatchMode: "cli_fallback", Attempt: 1, MaxAttempts: 15, ConsecutiveRetry: 1, MaxConsecutive: 5,
+		StartedAt: now.Add(-time.Minute), DispatchStartedAt: now.Add(-time.Minute),
+		StartDeadline: now.Add(-time.Minute),
+	}}
+
+	d.reconcileAwaitingLifecycle(context.Background(), now)
+	thread := daemonThreadSnapshot(d, threadID)
+	if runner.callCount() != 0 || thread.Awaiting == nil || thread.Stopped != nil {
+		t.Fatalf("CLI fallback was probed through Desktop lifecycle: calls=%d thread=%+v", runner.callCount(), thread)
+	}
+
+	d.reconcileAwaitingLifecycle(context.Background(), now.Add(maxAutomaticRecoveryDuration))
+	thread = daemonThreadSnapshot(d, threadID)
+	if runner.callCount() != 0 || thread.Awaiting != nil || thread.Pending != nil || thread.Stopped == nil ||
+		thread.Stopped.Reason != "cli_fallback_timeout" {
+		t.Fatalf("CLI fallback did not stop safely at the bounded timeout: calls=%d thread=%+v", runner.callCount(), thread)
+	}
+	if jobs := d.dispatchDueLocked(now.Add(maxAutomaticRecoveryDuration + time.Hour)); len(jobs) != 0 {
+		t.Fatalf("timed-out CLI fallback created a duplicate job: %+v", jobs)
+	}
+}
+
 func TestAcknowledgedRetryStopsImmediatelyWhenCodexCloses(t *testing.T) {
 	threadID := "019fa17c-1e5f-7dc3-bae5-e84666ffc205"
 	runner := &lifecycleRunner{
@@ -1359,6 +1664,7 @@ func TestLifecycleProbeFailuresStopAtControllerLimit(t *testing.T) {
 func TestDispatchHonorsParallelLimitAndKeepsThreadsIndependent(t *testing.T) {
 	cfg := isolatedConfig(t.TempDir())
 	cfg.MaxParallelRetries = 2
+	cfg.ResumeIntervalSeconds = 0
 	d := newTestDaemon(t, cfg, successfulRunner())
 	now := time.Now().UTC()
 	for index, threadID := range []string{
@@ -1382,6 +1688,137 @@ func TestDispatchHonorsParallelLimitAndKeepsThreadsIndependent(t *testing.T) {
 	more := d.dispatchDueLocked(now)
 	if len(more) != 1 || more[0].ThreadID == jobs[0].ThreadID || more[0].ThreadID == jobs[1].ThreadID {
 		t.Fatalf("third task did not retain its independent queue entry: %+v", more)
+	}
+}
+
+func TestDispatchSpacesDifferentTasksWithoutWaitingForCompletion(t *testing.T) {
+	cfg := isolatedConfig(t.TempDir())
+	cfg.MaxParallelRetries = 2
+	cfg.ResumeIntervalSeconds = 30
+	d := newTestDaemon(t, cfg, successfulRunner())
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	for _, threadID := range []string{
+		"019f9d33-41f6-70a3-ab98-df2196cb7aa7",
+		"019f9d47-7e70-7120-9b69-776d8d25ae0e",
+	} {
+		d.state.Threads[threadID] = ThreadState{Pending: &PendingRetry{
+			EventKey: threadID, FailedTurnID: "failed", Class: classServer, DueAt: now, Attempt: 1,
+		}}
+	}
+	first := d.dispatchDueLocked(now)
+	if len(first) != 1 || len(d.active) != 1 || !d.state.LastResumeDispatchAt.Equal(now) {
+		t.Fatalf("first task was not dispatched and persisted independently: jobs=%+v state=%+v", first, d.state)
+	}
+	if early := d.dispatchDueLocked(now.Add(29 * time.Second)); len(early) != 0 {
+		t.Fatalf("second task ignored the configured spacing: %+v", early)
+	}
+	second := d.dispatchDueLocked(now.Add(30 * time.Second))
+	if len(second) != 1 || len(d.active) != 2 || second[0].ThreadID == first[0].ThreadID {
+		t.Fatalf("second task waited for completion instead of only the interval: jobs=%+v active=%d", second, len(d.active))
+	}
+}
+
+func TestTaskPlanControlsQuotaDispatchWithoutDisablingTransientRescue(t *testing.T) {
+	d := newTestDaemon(t, isolatedConfig(t.TempDir()), successfulRunner())
+	now := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
+	quotaID := "019f9d33-41f6-70a3-ab98-df2196cb7aa7"
+	serverID := "019f9d47-7e70-7120-9b69-776d8d25ae0e"
+	if _, err := saveTaskPlan(filepath.Join(d.dataDir, "task-plan.json"), 0,
+		[]string{quotaID, serverID}, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	d.state.Threads[quotaID] = ThreadState{Pending: &PendingRetry{
+		EventKey: "quota", FailedTurnID: "quota-turn", Class: classRateLimit, DueAt: now, Attempt: 1,
+	}}
+	d.state.Threads[serverID] = ThreadState{Pending: &PendingRetry{
+		EventKey: "server", FailedTurnID: "server-turn", Class: classServer, DueAt: now, Attempt: 1,
+	}}
+	jobs := d.dispatchDueLocked(now)
+	if len(jobs) != 1 || jobs[0].ThreadID != serverID {
+		t.Fatalf("explicitly unselected quota task resumed or transient rescue was blocked: %+v", jobs)
+	}
+	if d.state.Threads[quotaID].Pending == nil {
+		t.Fatal("unselected quota task lost its dormant retry state")
+	}
+}
+
+func TestTaskPlanReorderAffectsOnlyNextQuotaDispatch(t *testing.T) {
+	cfg := isolatedConfig(t.TempDir())
+	cfg.MaxParallelRetries = 2
+	cfg.ResumeIntervalSeconds = 30
+	d := newTestDaemon(t, cfg, successfulRunner())
+	now := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
+	firstID := "019f9d33-41f6-70a3-ab98-df2196cb7aa7"
+	secondID := "019f9d47-7e70-7120-9b69-776d8d25ae0e"
+	thirdID := "019f9d58-e254-7be2-91f8-a7df30958a12"
+	ids := []string{firstID, secondID, thirdID}
+	planPath := filepath.Join(d.dataDir, "task-plan.json")
+	plan, err := saveTaskPlan(planPath, 0, []string{firstID, secondID, thirdID}, ids, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, threadID := range ids {
+		d.state.Threads[threadID] = ThreadState{Pending: &PendingRetry{
+			EventKey: threadID, FailedTurnID: "failed", Class: classRateLimit, DueAt: now, Attempt: 1,
+		}}
+	}
+	first := d.dispatchDueLocked(now)
+	if len(first) != 1 || first[0].ThreadID != firstID {
+		t.Fatalf("first quota dispatch ignored the visible order: %+v", first)
+	}
+	if _, err := saveTaskPlan(planPath, plan.Revision, []string{thirdID, secondID, firstID}, ids, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if early := d.dispatchDueLocked(now.Add(29 * time.Second)); len(early) != 0 {
+		t.Fatalf("reorder bypassed resume spacing: %+v", early)
+	}
+	second := d.dispatchDueLocked(now.Add(30 * time.Second))
+	if len(second) != 1 || second[0].ThreadID != thirdID || len(d.active) != 2 {
+		t.Fatalf("reorder did not affect only the next dispatch: jobs=%+v active=%d", second, len(d.active))
+	}
+}
+
+func TestUnreadableTaskPlanFailsClosedForQuota(t *testing.T) {
+	d := newTestDaemon(t, isolatedConfig(t.TempDir()), successfulRunner())
+	now := time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)
+	threadID := "019f9d33-41f6-70a3-ab98-df2196cb7aa7"
+	if err := os.WriteFile(filepath.Join(d.dataDir, "task-plan.json"), []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d.state.Threads[threadID] = ThreadState{Pending: &PendingRetry{
+		EventKey: "quota", FailedTurnID: "failed", Class: classRateLimit, DueAt: now, Attempt: 1,
+	}}
+	if jobs := d.dispatchDueLocked(now); len(jobs) != 0 {
+		t.Fatalf("invalid plan accidentally enabled quota auto-resume: %+v", jobs)
+	}
+}
+
+func TestQuotaWaitPersistsExactDeadlineWithoutConsumingFailureBudget(t *testing.T) {
+	threadID := "019fa4e9-e837-78f8-b654-8cc09956f151"
+	d := newTestDaemon(t, isolatedConfig(t.TempDir()), successfulRunner())
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	retryAt := now.Add(4*time.Hour + 5*time.Second)
+	thread := ThreadState{Awaiting: &AwaitingRetry{
+		EventKey: "quota-event", FailedTurnID: "failed", Class: classRateLimit,
+		Attempt: 2, MaxAttempts: 15, ConsecutiveRetry: 2, MaxConsecutive: 5,
+		DispatchFailures: 2,
+	}}
+	d.state.Threads[threadID] = thread
+	d.rescheduleAwaitingAtLocked(threadID, thread, now, "quota_limited", retryAt, false)
+	pending := d.state.Threads[threadID].Pending
+	if pending == nil || !pending.DueAt.Equal(retryAt) || pending.WaitReason != "quota_limited" || pending.DispatchFailures != 2 || pending.Attempt != 2 {
+		t.Fatalf("quota wait changed retry budgets or lost its reset deadline: %+v", pending)
+	}
+	jobs := d.dispatchDueLocked(retryAt)
+	if len(jobs) != 1 || jobs[0].WaitReason != "quota_limited" {
+		t.Fatalf("quota recovery context was lost before the fresh preflight: %+v", jobs)
+	}
+	d.wg.Add(1)
+	d.runJob(context.Background(), jobs[0])
+	thread = d.state.Threads[threadID]
+	if thread.Awaiting == nil || thread.Awaiting.Attempt != 1 || thread.Awaiting.ConsecutiveRetry != 1 ||
+		thread.RecoveryAttempts != 1 || thread.ConsecutiveRetries != 1 || thread.RecoveryStartedAt.IsZero() {
+		t.Fatalf("accepted post-reset resume did not start a fresh quota recovery cycle: %+v", thread)
 	}
 }
 

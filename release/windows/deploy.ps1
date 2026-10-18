@@ -17,7 +17,7 @@ Set-StrictMode -Version 2
 
 function Write-Step {
     param([string]$Message)
-    Write-Host ('[Codex Auto Retry] ' + $Message)
+    Write-Host ('[CodexWorkResumer] ' + $Message)
 }
 
 function Test-CodexDesktopRunning {
@@ -42,7 +42,8 @@ function Test-SharedBackendInUse {
     $configPath = Join-Path $RuntimePath 'config.json'
     $config = $null
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        try { $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json } catch { }
+        try { $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json }
+        catch { return $true }
     }
     if ($config -and [bool]$config.shared_app_server_enabled) { return $true }
 
@@ -104,9 +105,9 @@ function Read-ReleaseManifest {
 
     $path = Join-Path $Root 'release-manifest.json'
     $manifest = Read-JsonDocument -Path $path
-    if ($null -eq $manifest -or $manifest.product -ne 'Codex Auto Retry' -or
+    if ($null -eq $manifest -or $manifest.product -ne 'CodexWorkResumer' -or
         $manifest.target -ne 'windows-x64') {
-        throw 'This folder is not a valid Codex Auto Retry Windows x64 release.'
+        throw 'This folder is not a valid CodexWorkResumer Windows x64 release.'
     }
     return $manifest
 }
@@ -221,7 +222,7 @@ function Assert-ExistingPluginIsOurs {
     }
     $manifest = Read-JsonDocument -Path (Join-Path $Path '.codex-plugin\plugin.json')
     if ($null -eq $manifest -or [string]$manifest.name -ne 'codex-auto-retry') {
-        throw "The existing target directory is not Codex Auto Retry: $Path"
+        throw "The existing target directory is not CodexWorkResumer: $Path"
     }
 }
 
@@ -507,15 +508,15 @@ try {
     )
 }
 catch {
-    throw 'Another Codex Auto Retry upgrade or repair is already in progress.'
+    throw 'Another CodexWorkResumer upgrade or repair is already in progress.'
 }
 
 try {
     $unfinished = Read-UpgradeJournal -Path $upgradeJournalPath
     if ($unfinished) {
         $phase = [string]$unfinished.phase
-        if ($phase -ne 'committed' -and (Test-CodexDesktopRunning)) {
-            throw 'An interrupted upgrade is waiting for recovery. Close Codex completely before running the repair again.'
+        if ($phase -ne 'committed' -and (Test-CodexDesktopRunning) -and (Test-SharedBackendInUse -RuntimePath $runtimePath)) {
+            throw 'An interrupted upgrade is waiting for recovery while Codex uses the active Auto-Resume Assistant channel. Close Codex before repairing it.'
         }
         if ($phase -eq 'committed') {
             Remove-Item -LiteralPath ([string]$unfinished.transaction_root) -Recurse -Force -ErrorAction SilentlyContinue
@@ -530,8 +531,8 @@ try {
         }
     }
 
-    if (Test-CodexDesktopRunning) {
-        throw 'Close Codex completely before installing or upgrading, including official-backend sessions. No plugin or runtime changes were made.'
+    if ((Test-CodexDesktopRunning) -and (Test-SharedBackendInUse -RuntimePath $runtimePath)) {
+        throw 'Codex is currently connected to Codex Auto-Resume Assistant. Close Codex before replacing that active recovery channel. Official-backend sessions may remain open.'
     }
 }
 catch {
@@ -655,7 +656,7 @@ try {
         Write-Host 'Restart Codex once so it connects to the shared recovery service, then open a new task to load the management panel.'
     }
     else {
-        Write-Host 'Shared recovery remains disabled; open a new task to load the management panel.'
+        Write-Host 'Installation completed without closing Codex. Quota monitoring can start immediately; open a new task if the updated management panel is not yet visible.'
     }
     [pscustomobject]@{
         Installed = $true

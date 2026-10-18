@@ -59,11 +59,14 @@ jobs:
       - name: Build and verify release archive
         shell: pwsh
         run: |
-          $manifest = Get-Content .\.codex-plugin\plugin.json -Raw -Encoding UTF8 | ConvertFrom-Json
-          $version = ([string]$manifest.version -split '\+', 2)[0]
+          & .\scripts\collect-third-party-licenses.ps1 -Check
+          if (-not $?) { throw 'Third-party license bundle validation failed.' }
+          $record = Get-Content .\VERSION.json -Raw -Encoding UTF8 | ConvertFrom-Json
+          $version = [string]$record.version
+          $build = [int]$record.build
           $output = Join-Path $env:RUNNER_TEMP 'codex-auto-retry-release'
           & .\scripts\build-release.ps1 -SkipBuild -OutputDirectory $output
           if (-not $?) { throw 'Release packaging failed.' }
-          $archive = Join-Path $output ("Codex-Auto-Retry-$version-windows-x64.zip")
+          $archive = Join-Path $output ("CodexWorkResumer-v$version-b$build-windows-x64.zip")
           & .\scripts\release-test.ps1 -ArchivePath $archive
           if (-not $?) { throw 'Release integrity validation failed.' }

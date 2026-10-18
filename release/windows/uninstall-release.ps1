@@ -14,7 +14,7 @@ Set-StrictMode -Version 2
 
 function Write-Step {
     param([string]$Message)
-    Write-Host ('[Codex Auto Retry] ' + $Message)
+    Write-Host ('[CodexWorkResumer] ' + $Message)
 }
 
 function Test-PluginInstalled {
@@ -181,7 +181,7 @@ try {
         }
         $manifest = Read-JsonDocument -Path (Join-Path $pluginTarget '.codex-plugin\plugin.json')
         if ($null -eq $manifest -or [string]$manifest.name -ne 'codex-auto-retry') {
-            throw "The plugin target is not Codex Auto Retry: $pluginTarget"
+            throw "The plugin target is not CodexWorkResumer: $pluginTarget"
         }
         Remove-Item -LiteralPath $pluginTarget -Recurse -Force
     }

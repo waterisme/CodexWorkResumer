@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -134,6 +136,88 @@ func TestRecoveryChainStopsAtTimeSafetyLimit(t *testing.T) {
 	stopped := d.state.Threads[threadID].Stopped
 	if stopped == nil || stopped.Reason != "recovery_time_limit" {
 		t.Fatalf("recovery chain did not stop at its elapsed-time safety limit: %+v", stopped)
+	}
+}
+
+func TestRateLimitReachesFreshQuotaPreflightAfterLongWait(t *testing.T) {
+	config := isolatedConfig(t.TempDir())
+	config.MaxRecoveryAttempts = 15
+	config.MaxConsecutiveRetries = 5
+	d := newTestDaemon(t, config, successfulRunner())
+	threadID := "019fa94e-0103-7183-b405-36bd307b6dc1"
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	thread := ThreadState{
+		RecoveryAttempts:   1,
+		ConsecutiveRetries: 1,
+		RecoveryStartedAt:  now.Add(-5 * time.Hour),
+	}
+	item := scannedEvent{ThreadID: threadID, Event: RelevantEvent{
+		Kind: "task_complete", TurnID: "retry", Timestamp: now,
+		ErrorText: "HTTP 429 rate limit exceeded",
+	}}
+	d.scheduleFailureLocked(item, "quota-after-long-wait", now, thread, 2, 2, time.Time{}, false)
+	pending := d.state.Threads[threadID].Pending
+	if pending == nil || pending.Class != classRateLimit {
+		t.Fatalf("long quota wait was stopped before a fresh app-server preflight: %+v", d.state.Threads[threadID])
+	}
+}
+
+func TestCatalogResumeKeepsExistingQuotaResetDeadline(t *testing.T) {
+	threadID := "019fa94e-0103-7183-b405-36bd307b6dc9"
+	codexHome := filepath.Join(t.TempDir(), ".codex")
+	sessions := filepath.Join(codexHome, "sessions")
+	if err := os.MkdirAll(sessions, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rollout := filepath.Join(sessions, "rollout-2026-10-09T00-00-00-"+threadID+".jsonl")
+	if err := os.WriteFile(rollout, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := newTestDaemon(t, isolatedConfig(codexHome), successfulRunner())
+	now := time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC)
+	resetAt := now.Add(4 * time.Hour)
+	d.state.Threads[threadID] = ThreadState{
+		RecoveryAttempts: 2, ConsecutiveRetries: 2,
+		Pending: &PendingRetry{
+			EventKey: "rollout-quota", FailedTurnID: "failed-turn", Class: classRateLimit,
+			DueAt: resetAt, WaitReason: "quota_limited", CodexHome: codexHome, RolloutPath: rollout,
+			Attempt: 2, MaxAttempts: 15, ConsecutiveRetry: 2, MaxConsecutive: 5,
+		},
+	}
+	d.applyControlCommandLocked(ControlCommand{
+		Action: commandResumeTask, ThreadID: threadID, RolloutPath: rollout,
+		Class: classRateLimit, CreatedAt: now,
+	}, now)
+	thread := d.state.Threads[threadID]
+	if thread.Pending == nil || !thread.Pending.DueAt.Equal(resetAt) || thread.Pending.WaitReason != "quota_limited" ||
+		thread.Pending.EventKey != "rollout-quota" || thread.Pending.Attempt != 2 ||
+		thread.RecoveryAttempts != 2 || thread.ConsecutiveRetries != 2 {
+		t.Fatalf("catalog discovery changed an existing quota wait: %+v", thread)
+	}
+	if jobs := d.dispatchDueLocked(now); len(jobs) != 0 {
+		t.Fatalf("catalog discovery dispatched before the quota reset: %+v", jobs)
+	}
+
+	// The structured catalog may recognize quota exhaustion before a rollout
+	// parser does. Promote only the class; keep the scanner's retry budget and
+	// deadline while ensuring the next dispatch uses the quota preflight.
+	thread.Pending.Class = classUnknown
+	thread.Pending.DueAt = now.Add(time.Minute)
+	thread.Pending.WaitReason = ""
+	thread.Pending.MaxAttempts = 3
+	d.state.Threads[threadID] = thread
+	d.applyControlCommandLocked(ControlCommand{
+		Action: commandResumeTask, ThreadID: threadID, RolloutPath: rollout,
+		Class: classRateLimit, CreatedAt: now,
+	}, now)
+	thread = d.state.Threads[threadID]
+	if thread.Pending == nil || thread.Pending.Class != classRateLimit ||
+		!thread.Pending.DueAt.Equal(now.Add(time.Minute)) || thread.Pending.Attempt != 2 ||
+		thread.Pending.MaxAttempts != 3 || thread.RecoveryAttempts != 2 {
+		t.Fatalf("catalog quota code did not safely promote unknown retry: %+v", thread)
+	}
+	if jobs := d.dispatchDueLocked(now.Add(time.Minute)); len(jobs) != 1 || jobs[0].Class != classRateLimit {
+		t.Fatalf("promoted retry would miss the quota preflight: %+v", jobs)
 	}
 }
 

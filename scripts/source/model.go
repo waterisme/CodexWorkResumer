@@ -2,7 +2,10 @@ package main
 
 import "time"
 
-const appVersion = "0.7.11"
+const (
+	appVersion = "1.3.1"
+	appBuild   = 15
+)
 
 var buildSourceHash = "development"
 
@@ -49,6 +52,7 @@ type PendingRetry struct {
 	OriginTurnStartedAt time.Time    `json:"origin_turn_started_at,omitempty"`
 	Class               FailureClass `json:"class"`
 	DueAt               time.Time    `json:"due_at"`
+	WaitReason          string       `json:"wait_reason,omitempty"`
 	CodexHome           string       `json:"codex_home"`
 	RolloutPath         string       `json:"rollout_path,omitempty"`
 	Attempt             int          `json:"attempt"` // Per-fault recovery attempt; retained for state compatibility.
@@ -79,6 +83,8 @@ type AwaitingRetry struct {
 	RetryTurnID          string       `json:"retry_turn_id,omitempty"`
 	Class                FailureClass `json:"class"`
 	Action               RetryAction  `json:"action"`
+	DispatchMode         string       `json:"dispatch_mode,omitempty"`
+	WaitReason           string       `json:"wait_reason,omitempty"`
 	Attempt              int          `json:"attempt"`
 	MaxAttempts          int          `json:"max_attempts,omitempty"`
 	ConsecutiveRetry     int          `json:"consecutive_retry"`
@@ -121,27 +127,32 @@ type StoppedRetry struct {
 }
 
 type ThreadState struct {
-	RecoveryAttempts    int              `json:"recovery_attempts,omitempty"`
-	ConsecutiveRetries  int              `json:"consecutive_retries,omitempty"`
-	RecoveryStartedAt   time.Time        `json:"recovery_started_at,omitempty"`
-	LegacyFailures      int              `json:"consecutive_failures,omitempty"`
-	LastFailureAt       time.Time        `json:"last_failure_at,omitempty"`
-	LastAutoRetryAt     time.Time        `json:"last_auto_retry_at,omitempty"`
-	GoalStatus          string           `json:"goal_status,omitempty"`
-	GoalUpdatedAt       time.Time        `json:"goal_updated_at,omitempty"`
-	GoalObservedAt      time.Time        `json:"goal_observed_at,omitempty"`
-	GoalHeld            bool             `json:"goal_held,omitempty"`
-	LastStartedTurnID   string           `json:"last_started_turn_id,omitempty"`
-	LastStartedAt       time.Time        `json:"last_started_at,omitempty"`
-	LastExternalTurnID  string           `json:"last_external_turn_id,omitempty"`
-	LastExternalTurnAt  time.Time        `json:"last_external_turn_at,omitempty"`
-	CurrentTurnProgress bool             `json:"current_turn_progress,omitempty"`
-	LastAbortedTurnID   string           `json:"last_aborted_turn_id,omitempty"`
-	LastAbortedAt       time.Time        `json:"last_aborted_at,omitempty"`
-	Pending             *PendingRetry    `json:"pending,omitempty"`
-	Awaiting            *AwaitingRetry   `json:"awaiting,omitempty"`
-	Stopped             *StoppedRetry    `json:"stopped,omitempty"`
-	GoalStop            *GoalStopRequest `json:"goal_stop,omitempty"`
+	RecoveryAttempts                 int              `json:"recovery_attempts,omitempty"`
+	ConsecutiveRetries               int              `json:"consecutive_retries,omitempty"`
+	RecoveryStartedAt                time.Time        `json:"recovery_started_at,omitempty"`
+	LegacyFailures                   int              `json:"consecutive_failures,omitempty"`
+	LastFailureAt                    time.Time        `json:"last_failure_at,omitempty"`
+	LastAutoRetryAt                  time.Time        `json:"last_auto_retry_at,omitempty"`
+	GoalStatus                       string           `json:"goal_status,omitempty"`
+	GoalUpdatedAt                    time.Time        `json:"goal_updated_at,omitempty"`
+	GoalObservedAt                   time.Time        `json:"goal_observed_at,omitempty"`
+	GoalHeld                         bool             `json:"goal_held,omitempty"`
+	LastStartedTurnID                string           `json:"last_started_turn_id,omitempty"`
+	LastStartedAt                    time.Time        `json:"last_started_at,omitempty"`
+	ObservedTurnRunning              bool             `json:"observed_turn_running,omitempty"`
+	LastPositiveCompletionAt         time.Time        `json:"last_positive_completion_at,omitempty"`
+	LastPositiveCompletionObservedAt time.Time        `json:"last_positive_completion_observed_at,omitempty"`
+	LastRecoverySucceededAt          time.Time        `json:"last_recovery_succeeded_at,omitempty"`
+	LastTerminalNoRetryAt            time.Time        `json:"last_terminal_no_retry_at,omitempty"`
+	LastExternalTurnID               string           `json:"last_external_turn_id,omitempty"`
+	LastExternalTurnAt               time.Time        `json:"last_external_turn_at,omitempty"`
+	CurrentTurnProgress              bool             `json:"current_turn_progress,omitempty"`
+	LastAbortedTurnID                string           `json:"last_aborted_turn_id,omitempty"`
+	LastAbortedAt                    time.Time        `json:"last_aborted_at,omitempty"`
+	Pending                          *PendingRetry    `json:"pending,omitempty"`
+	Awaiting                         *AwaitingRetry   `json:"awaiting,omitempty"`
+	Stopped                          *StoppedRetry    `json:"stopped,omitempty"`
+	GoalStop                         *GoalStopRequest `json:"goal_stop,omitempty"`
 }
 
 type FileCursor struct {
@@ -150,11 +161,15 @@ type FileCursor struct {
 }
 
 type RuntimeState struct {
-	Version         int                    `json:"version"`
-	Initialized     bool                   `json:"initialized"`
-	Files           map[string]FileCursor  `json:"files"`
-	Threads         map[string]ThreadState `json:"threads"`
-	ProcessedEvents map[string]time.Time   `json:"processed_events"`
+	Version                     int                    `json:"version"`
+	Initialized                 bool                   `json:"initialized"`
+	LastResumeDispatchAt        time.Time              `json:"last_resume_dispatch_at,omitempty"`
+	QuotaSchedulerOwnerID       string                 `json:"quota_scheduler_owner_thread_id,omitempty"`
+	QuotaCapacityWasFull        bool                   `json:"quota_capacity_was_full,omitempty"`
+	QuotaCapacityAvailableSince time.Time              `json:"quota_capacity_available_since,omitempty"`
+	Files                       map[string]FileCursor  `json:"files"`
+	Threads                     map[string]ThreadState `json:"threads"`
+	ProcessedEvents             map[string]time.Time   `json:"processed_events"`
 }
 
 type RetryJob struct {
@@ -175,6 +190,7 @@ type RetryJob struct {
 	ParentNotified      bool
 	GoalLimitRestart    bool
 	RecoveryEventID     string
+	WaitReason          string
 }
 
 type RetryJobKind string
@@ -199,11 +215,12 @@ type DispatchResult struct {
 	Action         RetryAction     `json:"action"`
 	Reason         string          `json:"reason,omitempty"`
 	ParentNotified bool            `json:"parent_notified,omitempty"`
+	RetryAt        time.Time       `json:"retry_at,omitempty"`
 }
 
 // desktopCapability describes the transport the watchdog has actually proved.
-// Official stdio is observable but is not externally injectable on Windows;
-// only a verified shared WebSocket supports automatic recovery.
+// The optional CLI fallback is reported separately from the Desktop transport
+// because it resumes the same session in a headless process, not in the GUI.
 type desktopCapability struct {
 	Transport    string
 	RecoveryMode string
@@ -211,28 +228,39 @@ type desktopCapability struct {
 	Reason       string
 }
 
-func capabilityForControllerState(state string, sharedEnabled bool) desktopCapability {
+func capabilityForControllerState(state string, sharedEnabled, cliFallbackEnabled bool) desktopCapability {
+	var capability desktopCapability
 	switch state {
 	case "ready":
-		return desktopCapability{Transport: "shared_websocket", RecoveryMode: "shared_websocket", Automatic: true, Reason: "verified"}
+		capability = desktopCapability{Transport: "shared_websocket", RecoveryMode: "shared_websocket", Automatic: true, Reason: "verified"}
 	case "official_ipc_ready":
-		return desktopCapability{Transport: "official_ipc", RecoveryMode: "official_ipc", Automatic: true, Reason: "verified"}
+		capability = desktopCapability{Transport: "official_ipc", RecoveryMode: "official_ipc", Automatic: true, Reason: "verified"}
 	case "codex_restart_required":
-		return desktopCapability{Transport: "official_stdio", RecoveryMode: "safe_launcher_required", Reason: "official_stdio_not_externally_controllable"}
+		capability = desktopCapability{Transport: "official_stdio", RecoveryMode: "safe_launcher_required", Reason: "official_stdio_not_externally_controllable"}
 	case "codex_not_running":
-		return desktopCapability{Transport: "stopped", RecoveryMode: "none", Reason: "codex_not_running"}
+		capability = desktopCapability{Transport: "stopped", RecoveryMode: "none", Reason: "codex_not_running"}
 	case "codex_app_not_ready":
-		return desktopCapability{Transport: "unknown", RecoveryMode: "none", Reason: "desktop_connection_not_proven"}
+		capability = desktopCapability{Transport: "unknown", RecoveryMode: "none", Reason: "desktop_connection_not_proven"}
 	case "shared_app_server_disabled":
-		return desktopCapability{Transport: "official_stdio", RecoveryMode: "none", Reason: "shared_backend_disabled"}
+		capability = desktopCapability{Transport: "official_stdio", RecoveryMode: "none", Reason: "shared_backend_disabled"}
 	case "shared_app_server_config_invalid", "shared_app_server_port_conflict", "shared_app_server_port_reserved", "shared_app_server_environment_conflict", "shared_app_server_ownership_unknown":
 		if sharedEnabled {
-			return desktopCapability{Transport: "unknown", RecoveryMode: "none", Reason: state}
+			capability = desktopCapability{Transport: "unknown", RecoveryMode: "none", Reason: state}
+		} else {
+			capability = desktopCapability{Transport: "official_stdio", RecoveryMode: "none", Reason: state}
 		}
-		return desktopCapability{Transport: "official_stdio", RecoveryMode: "none", Reason: state}
 	default:
-		return desktopCapability{Transport: "unknown", RecoveryMode: "none", Reason: state}
+		capability = desktopCapability{Transport: "unknown", RecoveryMode: "none", Reason: state}
 	}
+	if cliFallbackEnabled && !capability.Automatic {
+		switch state {
+		case "shared_app_server_disabled", "codex_restart_required", "codex_not_running", "codex_app_not_ready":
+			capability.RecoveryMode = "cli_fallback"
+			capability.Automatic = true
+			capability.Reason = "cli_fallback_opt_in"
+		}
+	}
+	return capability
 }
 
 type StatusSnapshot struct {
@@ -243,14 +271,17 @@ type StatusSnapshot struct {
 	AutomaticRecoverySupported          bool      `json:"automatic_recovery_supported"`
 	RecoveryCapabilityReason            string    `json:"recovery_capability_reason,omitempty"`
 	Version                             string    `json:"version"`
+	Build                               int       `json:"build"`
 	Running                             bool      `json:"running"`
 	PID                                 int       `json:"pid"`
 	StartedAt                           time.Time `json:"started_at"`
+	LastHeartbeatAt                     time.Time `json:"last_heartbeat_at"`
 	LastScanAt                          time.Time `json:"last_scan_at"`
 	WatchedRoots                        int       `json:"watched_roots"`
 	PendingRetries                      int       `json:"pending_retries"`
 	ActiveRetries                       int       `json:"active_retries"`
 	Paused                              bool      `json:"paused"`
+	MonitoringPaused                    bool      `json:"monitoring_paused"`
 	SharedAppServerEnabled              bool      `json:"shared_app_server_enabled"`
 	SharedAppServerRequested            bool      `json:"shared_app_server_requested"`
 	ControllerState                     string    `json:"controller_state,omitempty"`

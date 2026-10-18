@@ -108,7 +108,8 @@ function Test-CodexDesktopRunning {
 function Test-SharedBackendInUse {
     $config = $null
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        try { $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json } catch { }
+        try { $config = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json }
+        catch { return $true }
     }
     if ($config -and [bool]$config.shared_app_server_enabled) { return $true }
 
@@ -304,8 +305,9 @@ if (-not (Test-Path -LiteralPath $watchdogSource -PathType Leaf)) { throw "Built
 if (-not (Test-Path -LiteralPath $mcpSource -PathType Leaf)) { throw "Built MCP server not found: $mcpSource" }
 [void](Assert-CodexAutoRetryHostPath -Path $installDir)
 
-if (Test-CodexDesktopRunning) {
-    throw 'Close Codex Desktop completely before installing, upgrading, or recovering the runtime. No runtime or routing changes were made.'
+$desktopRunning = Test-CodexDesktopRunning
+if ($desktopRunning -and (Test-SharedBackendInUse)) {
+    throw 'Codex is currently connected to Codex Auto-Resume Assistant. Close Codex before replacing that active recovery channel. A normal official-backend installation does not require closing Codex.'
 }
 Recover-IncompleteInstall
 
@@ -313,10 +315,6 @@ $existingConfig = $null
 if (Test-Path -LiteralPath $configPath -PathType Leaf) {
     try { $existingConfig = Get-Content -Raw -Encoding UTF8 -LiteralPath $configPath | ConvertFrom-Json } catch { }
 }
-if (Test-CodexDesktopRunning) {
-	throw 'Codex Desktop is using the shared backend. Close Codex completely before installing or upgrading the runtime.'
-}
-
 $transactionRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-auto-retry-runtime-' + [guid]::NewGuid().ToString('N'))
 $backupRoot = Join-Path $transactionRoot 'previous'
 $environmentBackupPath = Join-Path $installDir 'environment-backup.json'

@@ -19,9 +19,16 @@ func TestCapabilityForControllerState(t *testing.T) {
 		{state: "codex_app_not_ready", transport: "unknown", recovery: "none", reason: "desktop_connection_not_proven"},
 	}
 	for _, test := range tests {
-		got := capabilityForControllerState(test.state, test.shared)
+		got := capabilityForControllerState(test.state, test.shared, false)
 		if got.Transport != test.transport || got.RecoveryMode != test.recovery || got.Automatic != test.automatic || got.Reason != test.reason {
 			t.Fatalf("capability for %q = %+v, want transport=%q recovery=%q automatic=%v reason=%q", test.state, got, test.transport, test.recovery, test.automatic, test.reason)
 		}
+	}
+}
+
+func TestDesktopCapabilityReportsOptInCLIFallbackSeparately(t *testing.T) {
+	got := capabilityForControllerState("shared_app_server_disabled", false, true)
+	if !got.Automatic || got.RecoveryMode != "cli_fallback" || got.Transport != "official_stdio" || got.Reason != "cli_fallback_opt_in" {
+		t.Fatalf("CLI fallback capability was not reported truthfully: %+v", got)
 	}
 }

@@ -22,6 +22,15 @@ func TestThreadIDFromPathUsesSessionIDForCurrentCodexRolloutNames(t *testing.T) 
 	}
 }
 
+func TestScanSessionsDoesNotTreatUnavailableRootAsHealthy(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing-sessions")
+	state := newRuntimeState()
+	state.Initialized = true
+	if _, err := scanSessions([]sessionRoot{{Sessions: missing}}, &state, time.Now(), false); err == nil {
+		t.Fatal("missing session directory was reported as a complete scan")
+	}
+}
+
 func TestScanSessionsRoutesCurrentCodexRolloutEventsToSessionID(t *testing.T) {
 	home := t.TempDir()
 	sessions := filepath.Join(home, "sessions", "2026", "09", "12")

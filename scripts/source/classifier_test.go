@@ -16,6 +16,13 @@ func TestClassifyFailure(t *testing.T) {
 	}{
 		{"cockpit auth pool", "unexpected status 503 Service Unavailable: auth_unavailable: no auth available", true, classServer, 0},
 		{"rate limit", "HTTP 429 Too Many Requests", true, classRateLimit, 0},
+		{"usage limit message", "usage limit", true, classRateLimit, 0},
+		{"snake usage code", "HTTP 400: usage_limit_exceeded", true, classRateLimit, 0},
+		{"camel usage code", "HTTP 400: usageLimitExceeded", true, classRateLimit, 0},
+		{"snake rate code", "HTTP 400: rate_limit_exceeded", true, classRateLimit, 0},
+		{"camel rate code", "HTTP 400: rateLimitExceeded", true, classRateLimit, 0},
+		{"snake session budget code", "session_budget_exceeded", true, classRateLimit, 0},
+		{"camel session budget code", "sessionBudgetExceeded", true, classRateLimit, 0},
 		{"network reset", "error sending request: connection reset by peer", true, classTransient, 0},
 		{"stream stopped", "stream disconnected before response.completed", true, classTransient, 0},
 		{"temporary auth", "authentication service unavailable, try again later", true, classAuthTransient, 0},

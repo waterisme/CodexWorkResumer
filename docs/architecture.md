@@ -557,7 +557,7 @@ The shared-server ownership record includes the plugin owner, version, PID,
 absolute executable, endpoint, and Codex home. Cleanup checks all of those
 fields plus the live process command line before stopping a process. Status
 readers also check the PID and heartbeat age, so a stale `running=true` JSON
-file is presented as “后台服务未运行”.
+file is presented as “背景服務未執行”.
 
 The uninstaller uses Codex's supported `plugin remove` command, stops the
 watchdog, removes current-user startup, and deletes only a plugin directory

@@ -12,7 +12,15 @@ import (
 // Even an interrupted test suite must never change the live Desktop route.
 func TestMain(m *testing.M) {
 	sharedAppServerEnvironmentName = fmt.Sprintf("CODEX_AUTO_RETRY_TEST_%d_%d", os.Getpid(), time.Now().UnixNano())
+	productionUsageAdapter := newCodexUsageAdapter
+	newCodexUsageAdapter = func(string, Config) TaskAdapter {
+		return &fakeAdapter{
+			value: UsageSnapshot{Adapter: adapterCodex, UnavailableReason: "test_usage_unavailable"},
+			err:   errAdapterUnavailable,
+		}
+	}
 	code := m.Run()
+	newCodexUsageAdapter = productionUsageAdapter
 	if err := restoreUserEnvironment(sharedAppServerEnvironmentName, "", false); err != nil {
 		fmt.Fprintln(os.Stderr, "test environment cleanup failed:", err)
 		code = 1

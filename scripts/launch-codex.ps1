@@ -89,7 +89,7 @@ function Get-CodexLaunchRoute {
     $result.Reason = 'shared_disabled'
     if ((Get-CodexAutoRetryStatusProperty $config 'shared_app_server_enabled' $false) -ne $true) { return $result }
     $result.Reason = 'worker_not_fresh'
-    $heartbeat = ConvertTo-CodexAutoRetryDateTimeOffset (Get-CodexAutoRetryStatusProperty $status 'last_scan_at')
+    $heartbeat = ConvertTo-CodexAutoRetryDateTimeOffset (Get-CodexAutoRetryStatusProperty $status 'last_heartbeat_at' (Get-CodexAutoRetryStatusProperty $status 'last_scan_at'))
     if ($null -eq $heartbeat -or (Get-CodexAutoRetryStatusProperty $status 'running' $false) -ne $true) { return $result }
     $age = ([DateTimeOffset]::UtcNow - $heartbeat.ToUniversalTime()).TotalSeconds
     if ($age -lt 0 -or $age -gt 15 -or -not (Test-CodexLaunchWorker $status $Runtime)) { return $result }
@@ -116,6 +116,27 @@ function Get-CodexDesktopExecutable {
         }
     }
     throw 'Cannot find the current-user OpenAI.Codex package executable. Install or repair Codex first.'
+}
+
+function Get-CodexDesktopAppID {
+    $packages = @(Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction Stop | Sort-Object Version -Descending)
+    foreach ($package in $packages) {
+        try {
+            [xml]$manifest = Get-AppxPackageManifest -Package $package -ErrorAction Stop
+            $application = @($manifest.Package.Applications.Application | Where-Object { $_.Id } | Select-Object -First 1)
+            if ($application.Count -gt 0) {
+                return ([string]$package.PackageFamilyName + '!' + [string]$application[0].Id)
+            }
+        } catch { }
+    }
+    throw 'Cannot find the current-user OpenAI.Codex application identity. Install or repair Codex first.'
+}
+
+function Start-CodexPackagedApp {
+    param([string]$AppID)
+    $argument = 'shell:AppsFolder\' + $AppID
+    Start-Process -FilePath 'explorer.exe' -ArgumentList @($argument) -WindowStyle Hidden
+    Start-Sleep -Milliseconds 900
 }
 
 function Wait-CodexDesktopStopped {
@@ -154,7 +175,7 @@ function Invoke-CodexLaunchRecovery {
             $null -eq $status -or $null -eq $status.PSObject.Properties['shared_app_server_requested'] -or
             (Get-CodexAutoRetryStatusProperty $status 'running' $false) -ne $true -or
             -not (Test-CodexLaunchWorker $status $Runtime)) { return $route }
-        $heartbeat = ConvertTo-CodexAutoRetryDateTimeOffset (Get-CodexAutoRetryStatusProperty $status 'last_scan_at')
+        $heartbeat = ConvertTo-CodexAutoRetryDateTimeOffset (Get-CodexAutoRetryStatusProperty $status 'last_heartbeat_at' (Get-CodexAutoRetryStatusProperty $status 'last_scan_at'))
         if ($null -eq $heartbeat -or ([DateTimeOffset]::UtcNow - $heartbeat).TotalSeconds -gt 15 -or $heartbeat -gt [DateTimeOffset]::UtcNow) { return $route }
         $id = [Guid]::NewGuid().ToString('N')
         $requestPath = Join-Path $Runtime 'shared-recovery-request.json'
@@ -212,6 +233,53 @@ function New-CodexDesktopStartInfo {
     return $info
 }
 
+function Test-CodexLaunchAccessDenied {
+    param($Failure)
+    $exception = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { $Failure }
+    while ($null -ne $exception) {
+        if ($exception -is [ComponentModel.Win32Exception] -and $exception.NativeErrorCode -eq 5) { return $true }
+        $exception = $exception.InnerException
+    }
+    return $false
+}
+
+function Start-CodexDirectProcess {
+    param([string]$Executable, $Route)
+    $child = [Diagnostics.Process]::Start((New-CodexDesktopStartInfo $Executable $Route))
+    try {
+        # Keep concurrent clicks out until the process is visible to the next probe.
+        if ($child.WaitForExit(1000)) { throw 'Codex exited immediately after launch. No automatic restart was attempted.' }
+    } finally { $child.Dispose() }
+}
+
+function Start-CodexDesktopForRoute {
+    param([string]$Executable, $Route)
+    if ($Route.Mode -eq 'official') {
+        Start-CodexPackagedApp -AppID (Get-CodexDesktopAppID)
+        return $Route
+    }
+    try {
+        Start-CodexDirectProcess -Executable $Executable -Route $Route
+        return $Route
+    } catch {
+        if (-not (Test-CodexLaunchAccessDenied $_)) { throw }
+        # Packaged-app activation does not inherit the verified endpoint.
+        Assert-CodexDesktopStopped -Executable $Executable
+        Start-CodexPackagedApp -AppID (Get-CodexDesktopAppID)
+        $Route.Mode = 'official'
+        $Route.Reason = 'shared_launch_access_denied'
+        return $Route
+    }
+}
+
+function Show-CodexLaunchFallbackWarning {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        $message = 'Windows denied direct shared-backend launch. Codex was requested through the official app entry instead. Shared-backend connection was not established; check the current status.'
+        [void][Windows.Forms.MessageBox]::Show($message, 'Codex safe launcher', 'OK', 'Warning')
+    } catch { }
+}
+
 function Write-CodexLaunchResult {
     param([string]$Runtime, [string]$Mode, [string]$Reason, [string]$Outcome)
     $temporary = $null
@@ -258,12 +326,9 @@ try {
     # Recheck immediately before creating the child; never delegate to a shell broker.
     $route = Get-CodexLaunchRoute -Runtime $DataDir -OfficialOnly:$Official
     Assert-CodexDesktopStopped -Executable $exe
-    $child = [Diagnostics.Process]::Start((New-CodexDesktopStartInfo $exe $route))
-    try {
-        # Keep concurrent clicks out until the process is visible to the next probe.
-        if ($child.WaitForExit(1000)) { throw 'Codex exited immediately after launch. No automatic restart was attempted.' }
-    } finally { $child.Dispose() }
+    $route = Start-CodexDesktopForRoute -Executable $exe -Route $route
     Write-CodexLaunchResult $DataDir $route.Mode $route.Reason 'launch_requested'
+    if ($route.Reason -eq 'shared_launch_access_denied') { Show-CodexLaunchFallbackWarning }
 } catch {
     if ($CheckOnly) { throw }
     Write-CodexLaunchResult $DataDir $route.Mode 'launch_refused_or_failed' 'failed'

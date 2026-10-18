@@ -58,8 +58,9 @@ else {
 $mcpProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $mcpTarget, [System.StringComparison]::OrdinalIgnoreCase) })
 $heartbeatFresh = $false
-if ($status -and $status.last_scan_at) {
-    $heartbeatFresh = Test-CodexAutoRetryHeartbeatFresh -Value $status.last_scan_at
+$heartbeatValue = if ($status -and $status.PSObject.Properties['last_heartbeat_at']) { $status.last_heartbeat_at } elseif ($status -and $status.PSObject.Properties['last_scan_at']) { $status.last_scan_at } else { $null }
+if ($heartbeatValue) {
+    $heartbeatFresh = Test-CodexAutoRetryHeartbeatFresh -Value $heartbeatValue
 }
 $config = $null
 if (Test-Path -LiteralPath $configPath) {

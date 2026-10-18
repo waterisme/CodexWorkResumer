@@ -26,6 +26,44 @@ $runSubKey = 'Software\Microsoft\Windows\CurrentVersion\Run'
 . (Join-Path $PSScriptRoot 'startup-approval.ps1')
 . (Join-Path $PSScriptRoot 'shared-server-status.ps1')
 
+$managerLanguagePath = Join-Path $installDir 'ui-language.json'
+$managerI18nPath = Join-Path $PSScriptRoot 'startup-manager-i18n.json'
+$script:managerLanguage = 'zh'
+$script:managerI18n = Get-Content -Raw -Encoding UTF8 -LiteralPath $managerI18nPath | ConvertFrom-Json
+if (Test-Path -LiteralPath $managerLanguagePath -PathType Leaf) {
+    try {
+        $savedManagerLanguage = Get-Content -Raw -Encoding UTF8 -LiteralPath $managerLanguagePath | ConvertFrom-Json
+        if ([string]$savedManagerLanguage.language -eq 'en') { $script:managerLanguage = 'en' }
+    }
+    catch { }
+}
+
+function Get-ManagerText {
+    param([Parameter(Mandatory = $true)][string]$Key)
+    $languageTable = $script:managerI18n.PSObject.Properties[$script:managerLanguage].Value
+    $property = $languageTable.PSObject.Properties[$Key]
+    if ($null -ne $property) { return [string]$property.Value }
+    return $Key
+}
+
+function Save-ManagerLanguage {
+    New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+    $record = [ordered]@{ language = $script:managerLanguage }
+    $temporary = $managerLanguagePath + '.tmp-' + [guid]::NewGuid().ToString('N')
+    try {
+        [System.IO.File]::WriteAllText($temporary, ($record | ConvertTo-Json), [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $managerLanguagePath -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Switch-ManagerLanguage {
+    $script:managerLanguage = if ($script:managerLanguage -eq 'zh') { 'en' } else { 'zh' }
+    Save-ManagerLanguage
+}
+
 function Open-RunKey {
     param([bool]$Writable)
     return [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($runSubKey, $Writable)
@@ -242,8 +280,9 @@ function Get-ManagerState {
     $sharedStateReadFailed = (Test-Path -LiteralPath $sharedStatePath -PathType Leaf) -and $null -eq $sharedState
     $processes = @(Get-ManagerProcesses)
     $heartbeatFresh = $false
-    if ($status -and $status.last_scan_at) {
-        $heartbeatFresh = Test-HeartbeatFresh -Value $status.last_scan_at
+    $heartbeatValue = Get-CodexAutoRetryStatusProperty -Status $status -Name 'last_heartbeat_at' -Default (Get-CodexAutoRetryStatusProperty -Status $status -Name 'last_scan_at')
+    if ($status -and $heartbeatValue) {
+        $heartbeatFresh = Test-HeartbeatFresh -Value $heartbeatValue
     }
     $serviceRunning = $null -ne $status -and [bool]$status.running -and $heartbeatFresh -and $processes.Count -gt 0
     $startupEntry = Get-RunValue
@@ -407,9 +446,60 @@ function Invoke-ManagerAction {
     }
 }
 
+function Get-ManagerStateRows {
+    param([Parameter(Mandatory = $true)]$State)
+    $fields = @(
+        @('PluginInstalled', 'state_plugin_installed'),
+        @('PluginVersion', 'state_plugin_version'),
+        @('InstallDir', 'state_install_dir'),
+        @('ServiceRunning', 'state_service_running'),
+        @('ProcessCount', 'state_process_count'),
+        @('ProcessIds', 'state_process_ids'),
+        @('HeartbeatFresh', 'state_heartbeat_fresh'),
+        @('RuntimeVersion', 'state_runtime_version'),
+        @('LastScanAt', 'state_last_scan'),
+        @('StartupMode', 'state_startup_mode'),
+        @('StartupEntry', 'state_startup_entry'),
+        @('StartupOwned', 'state_startup_owned'),
+        @('StartupApproved', 'state_startup_approved'),
+        @('SharedModeEnabled', 'state_shared_enabled'),
+        @('SharedModeRequested', 'state_shared_requested'),
+        @('SharedEndpointConfigured', 'state_shared_endpoint'),
+        @('DesktopLaunchMode', 'state_desktop_launch'),
+        @('SafeLauncher', 'state_safe_launcher'),
+        @('SharedServerState', 'state_shared_server'),
+        @('SharedServerVerification', 'state_shared_verification'),
+        @('SharedAppServerMemoryUsageMB', 'state_shared_memory'),
+        @('SharedAppServerMemoryLimitMB', 'state_shared_memory_limit'),
+        @('SharedAppServerMemoryGuardTriggered', 'state_shared_memory_guard'),
+        @('RetrySafetyWarning', 'state_retry_warning'),
+        @('StatusCompatibility', 'state_status_compatibility'),
+        @('StatusCompatibilityMessage', 'state_status_message'),
+        @('DataDirectoryExists', 'state_data_dir')
+    )
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($field in $fields) {
+        $property = $State.PSObject.Properties[[string]$field[0]]
+        $value = if ($null -eq $property -or $null -eq $property.Value -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            Get-ManagerText 'na'
+        }
+        elseif ($property.Value -is [bool]) {
+            if ([bool]$property.Value) { Get-ManagerText 'yes' } else { Get-ManagerText 'no' }
+        }
+        elseif ($property.Value -is [System.Array]) {
+            @($property.Value) -join ', '
+        }
+        else {
+            [string]$property.Value
+        }
+        $rows.Add([pscustomobject]@{ Label = Get-ManagerText ([string]$field[1]); Value = $value })
+    }
+    return $rows.ToArray()
+}
+
 function Format-ManagerState {
     param([Parameter(Mandatory = $true)]$State)
-    $State | Format-List * | Out-String -Width 120
+    return ((Get-ManagerStateRows -State $State | ForEach-Object { '{0}: {1}' -f $_.Label, $_.Value }) -join [Environment]::NewLine)
 }
 
 function Hide-ManagerConsoleWindow {
@@ -449,83 +539,115 @@ function Show-Manager {
     Add-Type -AssemblyName System.Drawing
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'Codex Auto Retry Startup Manager'
+    $form.Text = Get-ManagerText 'form_title'
     $form.StartPosition = 'CenterScreen'
-    $form.Size = New-Object System.Drawing.Size(720, 600)
-    $form.MinimumSize = New-Object System.Drawing.Size(620, 540)
+    $form.Size = New-Object System.Drawing.Size(940, 720)
+    $form.MinimumSize = New-Object System.Drawing.Size(840, 650)
 
     $title = New-Object System.Windows.Forms.Label
-    $title.Text = 'Codex Auto Retry Startup Manager'
+    $title.Text = Get-ManagerText 'form_title'
     $title.Font = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Bold)
-    $title.AutoSize = $true
+    $title.AutoSize = $false
     $title.Location = New-Object System.Drawing.Point(18, 15)
+    $title.Size = New-Object System.Drawing.Size(700, 34)
     $form.Controls.Add($title)
 
     $subtitle = New-Object System.Windows.Forms.Label
-    $subtitle.Text = 'Inspect startup, service, and shared-backend state. Actions are limited to this plugin.'
-    $subtitle.AutoSize = $true
+    $subtitle.Text = Get-ManagerText 'subtitle'
+    $subtitle.AutoSize = $false
     $subtitle.ForeColor = [System.Drawing.Color]::DimGray
-    $subtitle.Location = New-Object System.Drawing.Point(20, 48)
+    $subtitle.Location = New-Object System.Drawing.Point(20, 52)
+    $subtitle.Size = New-Object System.Drawing.Size(750, 38)
     $form.Controls.Add($subtitle)
 
-    $output = New-Object System.Windows.Forms.TextBox
-    $output.Multiline = $true
+    $language = New-Object System.Windows.Forms.Button
+    $language.Text = Get-ManagerText 'language_button'
+    $language.Anchor = 'Top,Right'
+    $language.Location = New-Object System.Drawing.Point(775, 16)
+    $language.Size = New-Object System.Drawing.Size(130, 34)
+    $language.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $form.Controls.Add($language)
+
+    $output = New-Object System.Windows.Forms.DataGridView
     $output.ReadOnly = $true
-    $output.ScrollBars = 'Vertical'
-    $output.Font = New-Object System.Drawing.Font('Consolas', 10)
+    $output.AllowUserToAddRows = $false
+    $output.AllowUserToDeleteRows = $false
+    $output.AllowUserToResizeRows = $false
+    $output.RowHeadersVisible = $false
+    $output.AutoSizeRowsMode = 'AllCells'
+    $output.SelectionMode = 'FullRowSelect'
+    $output.MultiSelect = $false
+    $output.BackgroundColor = [System.Drawing.SystemColors]::Window
+    $output.BorderStyle = 'FixedSingle'
+    $output.Font = New-Object System.Drawing.Font('Microsoft JhengHei UI', 9.25)
+    $output.DefaultCellStyle.WrapMode = 'True'
+    $output.DefaultCellStyle.Alignment = 'TopLeft'
+    [void]$output.Columns.Add('Property', (Get-ManagerText 'column_item'))
+    [void]$output.Columns.Add('Value', (Get-ManagerText 'column_value'))
+    $output.Columns[0].Width = 230
+    $output.Columns[0].Frozen = $true
+    $output.Columns[1].AutoSizeMode = 'Fill'
     $output.Anchor = 'Top,Bottom,Left,Right'
-    $output.Location = New-Object System.Drawing.Point(18, 78)
-    $output.Size = New-Object System.Drawing.Size(668, 330)
+    $output.Location = New-Object System.Drawing.Point(18, 95)
+    $output.Size = New-Object System.Drawing.Size(886, 400)
     $form.Controls.Add($output)
 
     $buttons = New-Object System.Windows.Forms.FlowLayoutPanel
     $buttons.FlowDirection = 'LeftToRight'
     $buttons.WrapContents = $true
     $buttons.Anchor = 'Bottom,Left,Right'
-    $buttons.Location = New-Object System.Drawing.Point(18, 420)
-    $buttons.Size = New-Object System.Drawing.Size(668, 124)
+    $buttons.Location = New-Object System.Drawing.Point(18, 510)
+    $buttons.Size = New-Object System.Drawing.Size(886, 140)
     $buttons.Padding = New-Object System.Windows.Forms.Padding(0)
     $form.Controls.Add($buttons)
 
     $refresh = New-Object System.Windows.Forms.Button
-    $refresh.Text = 'Refresh status'
-    $refresh.Width = 100
-    $refresh.Height = 30
+    $refresh.Text = Get-ManagerText 'refresh_status'
+    $refresh.Width = 210
+    $refresh.Height = 38
+    $refresh.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
     $buttons.Controls.Add($refresh)
 
     $definitions = @(
-        @('Launch Codex safely', 'launch-codex', $false),
-        @('Enable startup', 'enable', $false),
-        @('Disable startup', 'disable', $false),
-        @('Start service', 'start', $false),
-        @('Stop service', 'stop', $false),
-        @('Safe-disable shared backend', 'safe-disable', $true),
-        @('Uninstall, keep data', 'uninstall', $true),
-        @('Uninstall and remove data', 'uninstall-remove', $true)
+        @('launch_codex', 'launch-codex', $false),
+        @('enable_startup', 'enable', $false),
+        @('disable_startup', 'disable', $false),
+        @('start_service', 'start', $false),
+        @('stop_service', 'stop', $false),
+        @('safe_disable', 'safe-disable', $true),
+        @('uninstall_keep', 'uninstall', $true),
+        @('uninstall_remove', 'uninstall-remove', $true)
     )
+
+    $managerButtons = @{}
 
     $refreshView = {
         try {
-            $output.Text = Format-ManagerState -State (Get-ManagerState)
+            $output.Rows.Clear()
+            foreach ($row in @(Get-ManagerStateRows -State (Get-ManagerState))) {
+                [void]$output.Rows.Add([string]$row.Label, [string]$row.Value)
+            }
         }
         catch {
-            $output.Text = $_.Exception.Message
+            $output.Rows.Clear()
+            [void]$output.Rows.Add((Get-ManagerText 'action_failed'), $_.Exception.Message)
         }
     }.GetNewClosure()
 
     function Add-ManagerButton {
-        param([string]$Text, [string]$ButtonAction, [bool]$Danger, [scriptblock]$RefreshView)
+        param([string]$TextKey, [string]$ButtonAction, [bool]$Danger, [scriptblock]$RefreshView)
         $button = New-Object System.Windows.Forms.Button
-        $button.Text = $Text
-        $button.Width = 142
-        $button.Height = 30
+        $button.Text = Get-ManagerText $TextKey
+        $button.Width = 210
+        $button.Height = 38
+        $button.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
         if ($Danger) { $button.ForeColor = [System.Drawing.Color]::DarkRed }
         $handler = {
             try {
                 if ($ButtonAction -eq 'uninstall-remove') {
                     $confirm = [System.Windows.Forms.MessageBox]::Show(
-                        'This removes the plugin, runtime state, settings, and logs. Chat data is not touched. Continue?',
-                        'Confirm full uninstall',
+                        (Get-ManagerText 'confirm_remove_message'),
+                        (Get-ManagerText 'confirm_remove_title'),
                         [System.Windows.Forms.MessageBoxButtons]::YesNo,
                         [System.Windows.Forms.MessageBoxIcon]::Warning
                     )
@@ -533,14 +655,14 @@ function Show-Manager {
                     $script:RemoveData = $true
                     $script:NoPrompt = $true
                     $null = Invoke-ManagerAction -RequestedAction 'uninstall'
-                    [System.Windows.Forms.MessageBox]::Show('Full uninstall completed.', 'Codex Auto Retry') | Out-Null
+                    [System.Windows.Forms.MessageBox]::Show((Get-ManagerText 'full_uninstall_done'), 'CodexWorkResumer') | Out-Null
                     $form.Close()
                     return
                 }
                 if ($ButtonAction -eq 'uninstall') {
                     $confirm = [System.Windows.Forms.MessageBox]::Show(
-                        'This removes the plugin, startup entry, and service, but keeps retry settings, state, and logs. Continue?',
-                        'Confirm uninstall',
+                        (Get-ManagerText 'confirm_uninstall_message'),
+                        (Get-ManagerText 'confirm_uninstall_title'),
                         [System.Windows.Forms.MessageBoxButtons]::YesNo,
                         [System.Windows.Forms.MessageBoxIcon]::Question
                     )
@@ -548,7 +670,7 @@ function Show-Manager {
                     $script:RemoveData = $false
                     $script:NoPrompt = $true
                     $null = Invoke-ManagerAction -RequestedAction 'uninstall'
-                    [System.Windows.Forms.MessageBox]::Show('Uninstall completed. Runtime data was kept.', 'Codex Auto Retry') | Out-Null
+                    [System.Windows.Forms.MessageBox]::Show((Get-ManagerText 'uninstall_done'), 'CodexWorkResumer') | Out-Null
                     $form.Close()
                     return
                 }
@@ -556,18 +678,36 @@ function Show-Manager {
                 & $RefreshView
             }
             catch {
-                [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Action failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-                try { & $RefreshView } catch { $output.Text = $_.Exception.Message }
+                [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, (Get-ManagerText 'action_failed'), [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+                try { & $RefreshView } catch { $output.Rows.Clear(); [void]$output.Rows.Add((Get-ManagerText 'action_failed'), $_.Exception.Message) }
             }
         }.GetNewClosure()
         $button.Add_Click($handler)
         $buttons.Controls.Add($button)
+        $managerButtons[$ButtonAction] = [pscustomobject]@{ Button = $button; TextKey = $TextKey }
     }
 
     foreach ($definition in $definitions) {
-        Add-ManagerButton -Text $definition[0] -ButtonAction $definition[1] -Danger ([bool]$definition[2]) -RefreshView $refreshView
+        Add-ManagerButton -TextKey $definition[0] -ButtonAction $definition[1] -Danger ([bool]$definition[2]) -RefreshView $refreshView
     }
+    $applyLanguage = {
+        $form.Text = Get-ManagerText 'form_title'
+        $title.Text = Get-ManagerText 'form_title'
+        $subtitle.Text = Get-ManagerText 'subtitle'
+        $language.Text = Get-ManagerText 'language_button'
+        $refresh.Text = Get-ManagerText 'refresh_status'
+        $output.Columns[0].HeaderText = Get-ManagerText 'column_item'
+        $output.Columns[1].HeaderText = Get-ManagerText 'column_value'
+        foreach ($entry in $managerButtons.Values) {
+            $entry.Button.Text = Get-ManagerText $entry.TextKey
+        }
+    }.GetNewClosure()
     $refresh.Add_Click({ & $refreshView }.GetNewClosure())
+    $language.Add_Click({
+        Switch-ManagerLanguage
+        & $applyLanguage
+        & $refreshView
+    }.GetNewClosure())
     $form.Add_Shown({
         Hide-ManagerConsoleWindow
         # A hidden script host can also suppress the first ShowWindow call.
@@ -575,6 +715,7 @@ function Show-Manager {
         if ('CodexAutoRetry.NativeWindow' -as [type]) {
             [void][CodexAutoRetry.NativeWindow]::ShowWindow($form.Handle, 1)
         }
+        & $applyLanguage
         & $refreshView
         $form.Activate()
     }.GetNewClosure())

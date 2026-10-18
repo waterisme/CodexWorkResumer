@@ -4,6 +4,10 @@ $root = Join-Path $env:TEMP ('CodexBuildProof_' + [guid]::NewGuid().ToString('N'
 try {
     [void][IO.Directory]::CreateDirectory((Join-Path $root 'scripts\source'))
     [void][IO.Directory]::CreateDirectory((Join-Path $root 'scripts\bin'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $root '.codex-plugin'))
+    [IO.File]::WriteAllText((Join-Path $root 'VERSION.json'), '{"schema":1,"version":"1.0.0","build":1}')
+    [IO.File]::WriteAllText((Join-Path $root 'CHANGELOG.md'), '## 1.0.0+1')
+    [IO.File]::WriteAllText((Join-Path $root '.codex-plugin\plugin.json'), '{"name":"codex-auto-retry","version":"1.0.0+build.1"}')
     $source = Join-Path $root 'scripts\source\main.go'
     [IO.File]::WriteAllText($source,'package main')
     foreach ($name in @('codex-auto-retry.exe','codex-auto-retry-mcp.exe')) { [IO.File]::WriteAllText((Join-Path $root ('scripts\bin\'+$name)), 'fixture only') }

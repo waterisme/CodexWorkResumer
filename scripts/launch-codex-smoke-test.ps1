@@ -24,6 +24,9 @@ function Get-CimInstance { param($ClassName, $Filter, $ErrorAction)
     return $script:mockDesktop
 }
 function Get-AppxPackage { param($Name, $ErrorAction) return $script:mockPackages }
+function Get-AppxPackageManifest { param($Package, $ErrorAction)
+    return [xml]'<Package><Applications><Application Id="Codex" /></Applications></Package>'
+}
 function Get-CodexAutoRetrySharedServerStatus { param($State, $ExpectedPort)
     return [pscustomobject]@{ Status = $script:sharedStatus; Endpoint = 'ws://127.0.0.1:49622' }
 }
@@ -74,8 +77,9 @@ try {
     [void][IO.Directory]::CreateDirectory((Join-Path $root 'app'))
     $desktopExe = Join-Path $root 'app\ChatGPT.exe'
     [IO.File]::WriteAllText($desktopExe, 'test fixture, never launched')
-    $script:mockPackages = @([pscustomobject]@{ InstallLocation = $root; Version = '1.0' })
+    $script:mockPackages = @([pscustomobject]@{ InstallLocation = $root; Version = '1.0'; PackageFamilyName = 'OpenAI.Codex_test' })
     Assert-LaunchTest ((Get-CodexDesktopExecutable) -eq $desktopExe) 'current user package exact executable'
+    Assert-LaunchTest ((Get-CodexDesktopAppID) -eq 'OpenAI.Codex_test!Codex') 'packaged app identity'
     Remove-Item -LiteralPath $desktopExe -Force
     $codexExe = Join-Path $root 'app\Codex.exe'
     [IO.File]::WriteAllText($codexExe, 'test fixture, never launched')
@@ -95,6 +99,41 @@ try {
     $refused = $false
     try { Assert-CodexDesktopStopped $desktopExe } catch { $refused = $true }
     Assert-LaunchTest $refused 'unknown desktop identity rejected'
+
+    # Simulate packaged-app CreateProcess denial without launching real Codex.
+    $script:mockDesktop = @()
+    $realDirectStart = ${function:Start-CodexDirectProcess}
+    $realPackagedStart = ${function:Start-CodexPackagedApp}
+    $script:packagedActivations = 0
+    function Start-CodexPackagedApp { param([string]$AppID) $script:packagedActivations++ }
+    function Start-CodexDirectProcess { param([string]$Executable, $Route) throw ([ComponentModel.Win32Exception]::new(5)) }
+    try {
+        $wrappedDenial = [Exception]::new('Start failed', [ComponentModel.Win32Exception]::new(5))
+        Assert-LaunchTest (Test-CodexLaunchAccessDenied $wrappedDenial) 'wrapped access denied recognized'
+        Assert-LaunchTest (-not (Test-CodexLaunchAccessDenied ([ComponentModel.Win32Exception]::new(2)))) 'other Win32 errors excluded'
+        $sharedRoute = [pscustomobject]@{ Mode = 'shared'; Reason = 'verified'; Endpoint = 'ws://127.0.0.1:49622' }
+        $result = Start-CodexDesktopForRoute -Executable $desktopExe -Route $sharedRoute
+        Assert-LaunchTest ($result.Mode -eq 'official' -and $result.Reason -eq 'shared_launch_access_denied') 'access denied uses official route'
+        Assert-LaunchTest ($script:packagedActivations -eq 1) 'access denied activates packaged app once'
+        function Start-CodexPackagedApp { param([string]$AppID) throw ([InvalidOperationException]::new('activation failed')) }
+        $failedFallback = [pscustomobject]@{ Mode = 'shared'; Reason = 'verified'; Endpoint = 'ws://127.0.0.1:49622' }
+        $activationRefused = $false
+        try { $null = Start-CodexDesktopForRoute -Executable $desktopExe -Route $failedFallback } catch { $activationRefused = $true }
+        Assert-LaunchTest ($activationRefused -and $failedFallback.Mode -eq 'shared') 'failed activation never reports official route'
+        function Start-CodexPackagedApp { param([string]$AppID) $script:packagedActivations++ }
+        function Start-CodexDirectProcess { param([string]$Executable, $Route) throw ([InvalidOperationException]::new('other launch failure')) }
+        $otherRoute = [pscustomobject]@{ Mode = 'shared'; Reason = 'verified'; Endpoint = 'ws://127.0.0.1:49622' }
+        $otherRefused = $false
+        try { $null = Start-CodexDesktopForRoute -Executable $desktopExe -Route $otherRoute } catch { $otherRefused = $true }
+        Assert-LaunchTest ($otherRefused -and $otherRoute.Mode -eq 'shared') 'other launch errors remain failures'
+        Assert-LaunchTest ($script:packagedActivations -eq 1) 'other errors do not activate packaged app'
+        $officialRoute = [pscustomobject]@{ Mode = 'official'; Reason = 'shared_disabled'; Endpoint = $null }
+        $null = Start-CodexDesktopForRoute -Executable $desktopExe -Route $officialRoute
+        Assert-LaunchTest ($script:packagedActivations -eq 2) 'official route activates packaged app'
+    } finally {
+        ${function:Start-CodexDirectProcess} = $realDirectStart
+        ${function:Start-CodexPackagedApp} = $realPackagedStart
+    }
 
     # Exercise the real child environment path using PowerShell, never Codex.
     $env:CODEX_APP_SERVER_WS_URL = 'ws://127.0.0.1:1'

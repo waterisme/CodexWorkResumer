@@ -56,7 +56,10 @@ func (root sessionRoot) scanDirectories() []string {
 func scanSessionDirectory(directory string, root sessionRoot, state *RuntimeState, now time.Time, baseline bool, events *[]scannedEvent) error {
 	return filepath.WalkDir(directory, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return nil
+			// A scheduler handoff may trust the next successful scan as evidence
+			// that no follow-on turn appeared. Do not report a partial walk as
+			// successful when a directory becomes unavailable.
+			return walkErr
 		}
 		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), ".jsonl") {
 			return nil
@@ -67,7 +70,7 @@ func scanSessionDirectory(directory string, root sessionRoot, state *RuntimeStat
 		}
 		info, err := entry.Info()
 		if err != nil {
-			return nil
+			return err
 		}
 		key := strings.ToLower(filepath.Clean(path))
 		cursor, known := state.Files[key]
@@ -93,7 +96,7 @@ func scanSessionDirectory(directory string, root sessionRoot, state *RuntimeStat
 		}
 		newEvents, nextOffset, err := readAppendedEvents(path, cursor.Offset, threadID, root, mirrored)
 		if err != nil {
-			return nil
+			return err
 		}
 		*events = append(*events, newEvents...)
 		state.Files[key] = FileCursor{Offset: nextOffset, LastSeen: now}

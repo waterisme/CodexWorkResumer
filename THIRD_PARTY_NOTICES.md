@@ -1,5 +1,39 @@
 # Third-Party Notices
 
+CodexWorkResumer is an MIT-licensed fork of
+[sybxxx/codex-auto-retry](https://github.com/sybxxx/codex-auto-retry). The
+original copyright and permission notice are retained in `LICENSE`.
+The entries below identify dependencies used by the Go binaries or the
+embedded management panel. Versions are locked in `scripts/source/go.mod`
+and `scripts/source/ui/package-lock.json`. The Go standard library/runtime
+license and patent grant, plus full license texts for the 8 Go modules and
+96 npm non-dev packages, are in `THIRD_PARTY_LICENSES.txt`.
+Build-only dependencies are not installed on end-user machines. Re-check the
+lockfiles, bundle, and any additional notice obligations before a public
+binary release.
+
+| Dependency | Version | License | Use |
+| --- | --- | --- | --- |
+| `github.com/gorilla/websocket` | 1.5.3 | BSD-2-Clause | Go runtime |
+| `github.com/google/jsonschema-go` | 0.4.3 | MIT | Go runtime (indirect) |
+| `github.com/modelcontextprotocol/go-sdk` | 1.6.1 | Apache-2.0 / MIT (per-file transition) | Go runtime |
+| `github.com/segmentio/asm` | 1.1.3 | MIT | Go runtime (indirect) |
+| `github.com/segmentio/encoding` | 0.5.4 | MIT | Go runtime (indirect) |
+| `github.com/yosida95/uritemplate/v3` | 3.0.2 | BSD-3-Clause | Go runtime (indirect) |
+| `golang.org/x/oauth2` | 0.35.0 | BSD-3-Clause | Go runtime (indirect) |
+| `golang.org/x/sys` | 0.41.0 | BSD-3-Clause | Go runtime |
+| `@modelcontextprotocol/ext-apps` | 1.7.5 | Apache-2.0 / MIT (per-file transition) | Embedded panel |
+| `@modelcontextprotocol/sdk` | 1.32.1 | MIT | Embedded panel |
+| `lucide` | 1.27.0 | ISC / MIT (icon-dependent) | Embedded panel |
+| `zod` | 4.1.13 | MIT | Embedded panel |
+| `vite`, `vite-plugin-singlefile`, `typescript` | locked versions | MIT | Build only |
+
+The npm lockfile also includes transitive packages, including MPL-2.0
+Lightning CSS build tooling. Those packages are marked dev-only and are not
+included in the generated runtime license bundle or installed on end-user
+machines. The locked dependency tree and bundle must be re-checked for each
+release.
+
 ## Gorilla WebSocket
 
 Copyright (c) 2013 The Gorilla WebSocket Authors. All rights reserved.

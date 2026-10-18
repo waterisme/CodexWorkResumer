@@ -41,7 +41,7 @@
 | `release/windows/deploy.ps1` | One-click deployment engine: validates the package, writes the direct background MCP launcher, safely updates the personal marketplace, registers the plugin, installs the runtime, and verifies the result. |
 | `release/windows/uninstall-release.ps1` | Removes Codex registration, startup, and installed source while preserving runtime data unless full removal is explicitly requested. |
 | `release/windows/common.ps1` | Shared path-safety, JSON, executable validation, and Codex CLI discovery helpers for release deployment. |
-| `release/windows/安装.cmd`, `release/windows/卸载.cmd`, `release/windows/启动管理器.cmd`, `release/windows/启动管理器.vbs`, `release/windows/安全停用.cmd` | Double-click entry points for installation, clean removal, startup management, and break-glass shared-backend disable; the VBS helper starts the graphical manager without a console. |
+| `release/windows/安裝.cmd`, `release/windows/卸載.cmd`, `release/windows/啟動管理器.cmd`, `release/windows/startup-manager.vbs`, `release/windows/安全停用.cmd` | Double-click entry points for installation, clean removal, startup management, and break-glass shared-backend disable; the VBS helper starts the graphical manager without a console. |
 
 ## Watchdog Source
 
@@ -127,7 +127,7 @@ local history or remote configuration.
 the recovery and consecutive no-progress limits, provider-specific lower limits, task-start acknowledgement timeout, optional session
 roots, maximum parallel retries, the normal-conversation fallback prompt, and
 the watchdog retry-limit notification preference. Normal recovery first starts a silent
-empty-input continuation. The fallback prompt defaults to `继续`, is limited to
+empty-input continuation. The fallback prompt defaults to `繼續`, is limited to
 500 characters, and is used only when Codex explicitly rejects an empty-input
 turn. It is reloaded immediately before each normal-conversation dispatch. The
 per-fault recovery limit defaults to 15 and accepts values from 1 through 1000.

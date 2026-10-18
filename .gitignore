@@ -1,6 +1,26 @@
 # Local installation metadata
 .codex-auto-retry-release.json
 
+# Never commit local credentials or runtime/user records
+.env
+.env.*
+!.env.example
+config.json
+state.json
+*.jsonl
+*.log
+*.log.*
+*.db
+*.sqlite*
+.codex/
+.go-test-tmp/
+.go-build-cache/
+
+# Local handoff material and unsanitized documentation captures
+MiniMonitor-獨立程式交接.txt
+assets/*.png
+docs/*.pptx
+
 # Frontend dependencies are restored from package-lock.json
 scripts/source/ui/node_modules/
 
@@ -13,3 +33,6 @@ scripts/bin/*
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Locally verified Windows release archives
+dist/

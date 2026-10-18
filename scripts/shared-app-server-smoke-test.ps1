@@ -163,14 +163,22 @@ class RpcClient {
 }
 
 async function connectClient(endpoint, name) {
-  const deadline = Date.now() + 15000;
+  // A cold Codex app-server start can exceed 15 seconds on Windows while its
+  // bundled runtime initializes. Keep this bounded, but do not fail before the
+  // server that printed its listening endpoint has had a chance to accept.
+  const deadline = Date.now() + 45000;
+  let lastError = 'connection not attempted';
   while (Date.now() < deadline) {
+    let socket;
     try {
-      const socket = new WebSocket(endpoint);
+      socket = new WebSocket(endpoint);
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error('open timeout')), 1500);
         socket.addEventListener('open', () => { clearTimeout(timer); resolve(); }, { once: true });
-        socket.addEventListener('error', () => { clearTimeout(timer); reject(new Error('open failed')); }, { once: true });
+        socket.addEventListener('error', event => {
+          clearTimeout(timer);
+          reject(new Error(`open failed: ${event?.message || 'unknown WebSocket error'}`));
+        }, { once: true });
       });
       const client = new RpcClient(name, socket);
       await client.call('initialize', {
@@ -179,11 +187,16 @@ async function connectClient(endpoint, name) {
       });
       client.notify('initialized', {});
       return client;
-    } catch {
+    } catch (error) {
+      lastError = error?.stack || String(error);
+      if (socket) {
+        try { socket.close(); } catch {}
+      }
+      if (appServer?.exitCode !== null) break;
       await delay(150);
     }
   }
-  throw new Error(`Could not connect to ${endpoint}. App-server stderr: ${stderr.slice(-2000)}`);
+  throw new Error(`Could not connect to ${endpoint}. Last client error: ${lastError}. App-server exit: ${appServer?.exitCode}. App-server stderr: ${stderr.slice(-2000)}`);
 }
 
 function userInputCount(body) {
@@ -231,7 +244,7 @@ function userInputCount(body) {
 
     appServer = spawn(
       process.env.CODEX_SHARED_SERVER_TEST_CODEX_EXE,
-      ['-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled', '--listen', endpoint],
+      ['--disable', 'plugins', '-c', 'features.code_mode_host=true', 'app-server', '--analytics-default-enabled', '--listen', endpoint],
       {
         windowsHide: true,
         env: {
@@ -321,7 +334,10 @@ function userInputCount(body) {
 '@
 
 try {
-    & $node.Source -e $nodeScript
+    # Node.js 20 ships the WHATWG WebSocket client behind this flag. Newer
+    # versions accept it as well, so the smoke test remains portable without
+    # adding a separate npm WebSocket dependency.
+    & $node.Source --experimental-websocket -e $nodeScript
     if ($LASTEXITCODE -ne 0) { throw 'Shared app-server smoke test failed.' }
 }
 finally {

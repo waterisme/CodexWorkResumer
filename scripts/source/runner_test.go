@@ -43,6 +43,17 @@ func TestValidateDispatchResultRejectsInvalidAction(t *testing.T) {
 	}
 }
 
+func TestValidateDispatchResultRejectsRetryDeadlineOnAcceptedDispatch(t *testing.T) {
+	_, err := validateDispatchResult(DispatchResult{
+		Outcome: outcomeDispatched,
+		Action:  actionGoalResume,
+		RetryAt: time.Now().UTC().Add(time.Minute),
+	})
+	if err == nil {
+		t.Fatal("dispatch result accepted a retry-only deadline")
+	}
+}
+
 func TestValidateDispatchResultRejectsUnsafeReason(t *testing.T) {
 	_, err := validateDispatchResult(DispatchResult{
 		Outcome: outcomeRetryLater,
@@ -185,5 +196,52 @@ func TestFailOpenSharedBackendPersistsDisabledModeBeforeCleanup(t *testing.T) {
 	}
 	if loaded.SharedAppServerEnabled {
 		t.Fatal("fail-open did not persist the disabled shared-mode setting")
+	}
+}
+
+func TestQuotaGateWaitsWithoutConsumingAResume(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	dataDir := t.TempDir()
+	config := defaultConfig()
+	config.UsageRefreshMinutes = 5
+	if err := writeJSONAtomic(filepath.Join(dataDir, "config.json"), config); err != nil {
+		t.Fatal(err)
+	}
+	runner := &appResumeRunner{
+		configPath: filepath.Join(dataDir, "config.json"),
+		now:        func() time.Time { return now },
+		readUsage: func(context.Context) (UsageSnapshot, error) {
+			return UsageSnapshot{}, errors.New("offline")
+		},
+	}
+	result, wait := runner.quotaGate(context.Background(), RetryJob{Class: classRateLimit})
+	if !wait || result.Outcome != outcomeRetryLater || result.Reason != "quota_status_unavailable" ||
+		!result.RetryAt.Equal(now.Add(5*time.Minute)) {
+		t.Fatalf("quota read failure was not held for a fresh recheck: %+v wait=%v", result, wait)
+	}
+}
+
+func TestQuotaGateWaitsForResetWhenProviderAndPercentDisagree(t *testing.T) {
+	now := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	reset := now.Add(4 * time.Hour)
+	runner := &appResumeRunner{
+		now: func() time.Time { return now },
+		readUsage: func(context.Context) (UsageSnapshot, error) {
+			return UsageSnapshot{
+				Available: true, Source: "account/rateLimits/read",
+				FiveHour: &UsageWindow{UsedPercent: 10, ResetsAt: reset.Unix()},
+				Weekly:   &UsageWindow{UsedPercent: 40, ResetsAt: now.Add(4 * 24 * time.Hour).Unix()},
+			}, nil
+		},
+	}
+	result, wait := runner.quotaGate(context.Background(), RetryJob{Class: classRateLimit})
+	if !wait || result.Outcome != outcomeRetryLater || result.Reason != "quota_limited" ||
+		!result.RetryAt.Equal(reset.Add(quotaResetGrace)) {
+		t.Fatalf("conflicting provider limit should wait for the nearest reset: %+v wait=%v", result, wait)
+	}
+	now = reset.Add(10 * time.Second)
+	reset = now.Add(5 * time.Hour)
+	if result, wait := runner.quotaGate(context.Background(), RetryJob{Class: classRateLimit, WaitReason: "quota_limited"}); wait || result.Outcome != "" {
+		t.Fatalf("recovered quota did not return to the original resume path: %+v wait=%v", result, wait)
 	}
 }

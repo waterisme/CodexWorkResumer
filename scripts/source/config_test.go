@@ -19,7 +19,7 @@ func TestSharedPreferenceMigration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cfg.SharedAppServerRequested != enabled || cfg.ConfigVersion != 11 {
+		if cfg.SharedAppServerRequested != enabled || cfg.ConfigVersion != currentConfigVersion {
 			t.Fatalf("migration changed user preference: %+v", cfg)
 		}
 		cfg.SharedAppServerRequested = true
@@ -34,6 +34,34 @@ func TestSharedPreferenceMigration(t *testing.T) {
 		if !cfg.SharedAppServerRequested || cfg.SharedAppServerEnabled {
 			t.Fatal("temporary failure lost preference")
 		}
+	}
+}
+
+func TestCLIFallbackIsOptInAndMigratesDisabled(t *testing.T) {
+	if defaultConfig().CLIResumeFallbackEnabled {
+		t.Fatal("CLI Resume fallback must remain opt-in")
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	legacy := defaultConfig()
+	legacy.ConfigVersion = 12
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "cli_resume_fallback_enabled")
+	if err := writeJSONAtomic(path, fields); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadOrCreateConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ConfigVersion != currentConfigVersion || loaded.CLIResumeFallbackEnabled {
+		t.Fatalf("CLI fallback migration was not safely disabled: %+v", loaded)
 	}
 }
 
@@ -192,6 +220,16 @@ func TestConfigValidatesUserVisibleRetrySettings(t *testing.T) {
 		t.Fatal("recovery limit above the documented maximum was accepted")
 	}
 	config = defaultConfig()
+	config.ResumeIntervalSeconds = -1
+	if err := config.validate(); err == nil {
+		t.Fatal("negative task resume interval was accepted")
+	}
+	config = defaultConfig()
+	config.UsageRefreshMinutes = 0
+	if err := config.validate(); err == nil {
+		t.Fatal("zero quota refresh interval was accepted")
+	}
+	config = defaultConfig()
 	config.InitialDelaySeconds = 10
 	config.MaxDelaySeconds = 9
 	if err := config.validate(); err == nil {
@@ -253,7 +291,8 @@ func TestVersionFiveMigrationPreservesInstalledRetryPolicy(t *testing.T) {
 		loaded.MaxDelaySeconds != 1800 || loaded.DelayIncrementSeconds != 10 ||
 		loaded.DelayStrategy != delayStrategyFixed || loaded.MaxConsecutiveRetries != 100 ||
 		loaded.MaxRecoveryAttempts != 1000 || loaded.RetryPrompt != "继续" ||
-		loaded.SharedAppServerPort != defaultConfig().SharedAppServerPort || loaded.ControllerFailureLimit != 3 {
+		loaded.SharedAppServerPort != defaultConfig().SharedAppServerPort || loaded.ControllerFailureLimit != 3 ||
+		loaded.ResumeIntervalSeconds != 30 || loaded.UsageRefreshMinutes != 1 {
 		t.Fatalf("version five migration changed the installed retry policy: %+v", loaded)
 	}
 	if loaded.SharedAppServerEnabled {

@@ -1,9 +1,9 @@
 {
   "name": "codex-auto-retry",
-  "version": "0.7.11+codex.20260912105707",
-  "description": "Automatically resumes Codex tasks after recoverable provider failures, with a Windows tray controller and an embedded Codex panel.",
+  "version": "1.3.1+build.15",
+  "description": "Monitors quota and safely resumes interrupted Codex tasks from a lightweight Windows tray application.",
   "author": {
-    "name": "sybxxx (TQY Local Tools)"
+    "name": "CodexWorkResumer contributors; based on sybxxx/codex-auto-retry"
   },
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
@@ -15,10 +15,10 @@
     "provider"
   ],
   "interface": {
-    "displayName": "Codex Auto Retry",
-    "shortDescription": "Recover interrupted tasks with tray and Codex controls.",
-    "longDescription": "Runs a local, provider-independent watchdog that detects explicit provider failures and silent empty responses, then resumes the same task through a shared Codex app-server without adding a visible user message, focusing the App, or switching tasks. A Windows tray controller and embedded Codex panel show live countdowns, bounded controller health, separate per-fault and consecutive no-progress limits, fixed, linear, or doubling waits, queue state, pause controls, and retry settings.",
-    "developerName": "sybxxx (TQY Local Tools)",
+    "displayName": "CodexWorkResumer",
+    "shortDescription": "Monitor quota and recover interrupted Codex tasks.",
+    "longDescription": "Runs a local, provider-independent watchdog that detects explicit provider failures and silent empty responses, then resumes the same task through official IPC or an optional verified fallback. A Windows tray controller and embedded Codex panel show current quota, live countdowns, bounded controller health, separate per-fault and consecutive no-progress limits, queue state, pause controls, and retry settings.",
+    "developerName": "CodexWorkResumer contributors",
     "category": "Productivity",
     "capabilities": [
       "Automation",
@@ -26,9 +26,9 @@
       "Local"
     ],
     "defaultPrompt": [
-      "\u6253\u5f00 Codex Auto Retry \u7ba1\u7406\u9762\u677f\u3002",
-      "\u67e5\u770b\u81ea\u52a8\u91cd\u8bd5\u961f\u5217\u548c\u5012\u8ba1\u65f6\u3002",
-      "\u4fee\u6539 Codex Auto Retry \u7684\u540e\u5907\u91cd\u8bd5\u6587\u5b57\u3002"
+      "開啟 CodexWorkResumer 管理面板。",
+      "查看自動重試佇列、使用額度與倒數計時。",
+      "修改 CodexWorkResumer 的自動恢復設定。"
     ]
   }
 }

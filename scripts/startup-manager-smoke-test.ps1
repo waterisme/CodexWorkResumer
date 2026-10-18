@@ -4,13 +4,20 @@ param()
 $ErrorActionPreference = 'Stop'
 $manager = Join-Path $PSScriptRoot 'startup-manager.ps1'
 if (-not (Test-Path -LiteralPath $manager -PathType Leaf)) { throw 'startup-manager.ps1 is missing.' }
+$i18nPath = Join-Path $PSScriptRoot 'startup-manager-i18n.json'
+if (-not (Test-Path -LiteralPath $i18nPath -PathType Leaf)) { throw 'startup-manager-i18n.json is missing.' }
+$i18n = Get-Content -Raw -Encoding UTF8 -LiteralPath $i18nPath | ConvertFrom-Json
+if ([string]$i18n.zh.form_title -notmatch 'CodexWorkResumer' -or [string]::IsNullOrWhiteSpace([string]$i18n.zh.safe_disable) -or
+    [string]$i18n.en.disable_startup -ne 'Disable Sign-in Startup') {
+    throw 'Startup manager translations are incomplete.'
+}
 
 $tokens = $null
 $errors = $null
 [void][System.Management.Automation.Language.Parser]::ParseFile($manager, [ref]$tokens, [ref]$errors)
 if ($errors.Count -gt 0) { throw "PowerShell parse error: $($errors[0].Message)" }
 $source = Get-Content -Raw -Encoding UTF8 -LiteralPath $manager
-foreach ($required in @('Set-ManagedStartup', 'Remove-ManagedStartup', 'Restore-ManagedStartupValue', 'Get-ManagerState', 'Hide-ManagerConsoleWindow', '$refreshView', '-RefreshView $refreshView', 'safe-disable', 'uninstall', 'supervise', 'Test-OwnedStartupValue', 'StartupApproved')) {
+foreach ($required in @('Set-ManagedStartup', 'Remove-ManagedStartup', 'Restore-ManagedStartupValue', 'Get-ManagerState', 'Hide-ManagerConsoleWindow', 'Get-ManagerText', 'Save-ManagerLanguage', '$refreshView', '-RefreshView $refreshView', 'safe-disable', 'uninstall', 'supervise', 'Test-OwnedStartupValue', 'StartupApproved')) {
     if (-not $source.Contains($required)) { throw "Startup manager is missing required behavior: $required" }
 }
 
@@ -34,6 +41,7 @@ $testRoot = Join-Path $env:TEMP ('codex-auto-retry-manager-' + [guid]::NewGuid()
 $profileRoot = Join-Path $testRoot 'profile'
 $localRoot = Join-Path $testRoot 'local'
 New-Item -ItemType Directory -Force -Path (Join-Path $localRoot 'CodexAutoRetry'), (Join-Path $profileRoot 'plugins\codex-auto-retry\.codex-plugin') | Out-Null
+[IO.File]::WriteAllText((Join-Path $localRoot 'CodexAutoRetry\ui-language.json'), '{"language":"en"}', [Text.UTF8Encoding]::new($false))
 $fakeWatchdog = Join-Path $localRoot 'CodexAutoRetry\codex-auto-retry.exe'
 [IO.File]::WriteAllBytes($fakeWatchdog, [byte[]](0..31))
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -181,9 +189,9 @@ try {
         Start-Sleep -Milliseconds 250
         $guiWindow = Get-Process -Id $guiProcess.Id -ErrorAction SilentlyContinue
     } while (-not $guiProcess.HasExited -and
-        ($null -eq $guiWindow -or $guiWindow.MainWindowTitle -ne 'Codex Auto Retry Startup Manager') -and (Get-Date) -lt $deadline)
+        ($null -eq $guiWindow -or $guiWindow.MainWindowTitle -ne 'CodexWorkResumer Startup Manager') -and (Get-Date) -lt $deadline)
     if ($guiProcess.HasExited -or $null -eq $guiWindow -or $guiWindow.MainWindowHandle -eq 0 -or
-        $guiWindow.MainWindowTitle -ne 'Codex Auto Retry Startup Manager') {
+        $guiWindow.MainWindowTitle -ne 'CodexWorkResumer Startup Manager') {
         throw ('Startup manager GUI did not create its visible settings window. ' + (Get-Content -LiteralPath $guiError -Raw))
     }
     Stop-Process -Id $guiProcess.Id -Force -ErrorAction SilentlyContinue
@@ -228,16 +236,80 @@ namespace CodexAutoRetrySmoke {
             throw 'Startup manager action test could not create its settings window.'
         }
         $automationWindow = [System.Windows.Automation.AutomationElement]::FromHandle($actionWindow.MainWindowHandle)
+        $languageButton = $automationWindow.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                [string]$i18n.en.language_button
+            )
+        )
+        if ($null -eq $languageButton) { throw 'Startup manager English UI is missing the language switch.' }
+        $languageClicked = $false
+        try {
+            $languageButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            $languageClicked = $true
+        }
+        catch {
+            if ($languageButton.Current.NativeWindowHandle -ne 0) {
+                $languageClicked = [CodexAutoRetrySmoke.Native]::PostMessage(
+                    [IntPtr]$languageButton.Current.NativeWindowHandle,
+                    0x00F5,
+                    [IntPtr]::Zero,
+                    [IntPtr]::Zero
+                )
+            }
+        }
+        if (-not $languageClicked) { throw 'Startup manager could not click the language switch.' }
+        $languageDeadline = (Get-Date).AddSeconds(5)
+        do {
+            Start-Sleep -Milliseconds 100
+            $actionWindow.Refresh()
+        } while ($actionWindow.MainWindowTitle -ne [string]$i18n.zh.form_title -and (Get-Date) -lt $languageDeadline)
+        if ($actionWindow.MainWindowTitle -ne [string]$i18n.zh.form_title) {
+            throw 'Startup manager did not switch to Traditional Chinese.'
+        }
+        $englishButton = $automationWindow.FindFirst(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                'English'
+            )
+        )
+        if ($null -eq $englishButton) { throw 'Startup manager Chinese UI is missing the English switch.' }
+        $englishClicked = $false
+        try {
+            $englishButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            $englishClicked = $true
+        }
+        catch {
+            if ($englishButton.Current.NativeWindowHandle -ne 0) {
+                $englishClicked = [CodexAutoRetrySmoke.Native]::PostMessage(
+                    [IntPtr]$englishButton.Current.NativeWindowHandle,
+                    0x00F5,
+                    [IntPtr]::Zero,
+                    [IntPtr]::Zero
+                )
+            }
+        }
+        if (-not $englishClicked) { throw 'Startup manager could not click the English switch.' }
+        $languageDeadline = (Get-Date).AddSeconds(5)
+        do {
+            Start-Sleep -Milliseconds 100
+            $actionWindow.Refresh()
+        } while ($actionWindow.MainWindowTitle -ne 'CodexWorkResumer Startup Manager' -and (Get-Date) -lt $languageDeadline)
+        if ($actionWindow.MainWindowTitle -ne 'CodexWorkResumer Startup Manager') {
+            throw 'Startup manager did not switch back to English.'
+        }
         $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
             [System.Windows.Automation.AutomationElement]::NameProperty,
-            'Disable startup'
+            'Disable Sign-in Startup'
         )
         $disableButton = $automationWindow.FindFirst(
             [System.Windows.Automation.TreeScope]::Descendants,
             $buttonCondition
         )
         if ($null -eq $disableButton -or $disableButton.Current.NativeWindowHandle -eq 0) {
-            throw 'Startup manager action test could not find the Disable startup button.'
+            throw 'Startup manager action test could not find the Disable Sign-in Startup button.'
         }
         $invoked = $false
         try {
@@ -275,7 +347,7 @@ namespace CodexAutoRetrySmoke {
             $errorDialog = @(
                 0..($topLevel.Count - 1) |
                     ForEach-Object { $topLevel.Item($_) } |
-                    Where-Object { $_.Current.Name -eq 'Action failed' }
+                    Where-Object { $_.Current.Name -eq 'Action Failed' }
             )
         }
         if (-not [string]::IsNullOrWhiteSpace($remainingValue)) {

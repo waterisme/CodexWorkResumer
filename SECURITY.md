@@ -1,13 +1,13 @@
 # Security Policy
 
-Codex Auto Retry runs locally and observes Codex lifecycle metadata. It can
+CodexWorkResumer runs locally and observes Codex lifecycle metadata. It can
 start a plugin-owned loopback recovery backend when the user explicitly enables
 that mode, so process ownership, endpoint routing, credential handling, and
 rollback behavior are security-sensitive.
 
 ## Reporting A Vulnerability
 
-Please use a [private GitHub Security Advisory](https://github.com/sybxxx/codex-auto-retry/security/advisories/new)
+Please use a [private GitHub Security Advisory](https://github.com/waterisme/CodexWorkResumer/security/advisories/new)
 when available. Do not open a public issue for an unpatched vulnerability.
 
 Include the affected release, Windows version, reproduction steps, and the
@@ -23,7 +23,7 @@ Security issues include, but are not limited to:
 - unverified process termination or cross-process control; and
 - data loss, duplicate task creation, or an unbounded retry loop.
 
-The current release is the recommended version for security fixes. Reports are
+Use the latest published release when one is available. Reports are
 triaged privately and may result in a patch release, documentation update, or a
 fail-open change that disables an unsafe recovery path.
 

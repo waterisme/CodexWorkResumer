@@ -10,6 +10,7 @@ $watchdogOutput = Join-Path $binDir 'codex-auto-retry.exe'
 $mcpOutput = Join-Path $binDir 'codex-auto-retry-mcp.exe'
 $settingsScript = Join-Path $sourceDir 'ui\settings.ps1'
 . (Join-Path $PSScriptRoot 'build-provenance.ps1')
+& (Join-Path $PSScriptRoot 'verify-version.ps1') | Out-Null
 
 $settingsSource = [System.IO.File]::ReadAllText($settingsScript, [System.Text.UTF8Encoding]::new($false))
 $tokens = $null
@@ -43,11 +44,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Go vet failed.' }
     $sourceHash = Get-CodexBuildSourceHash -Root $pluginRoot
     $buildFlags = '-s -w -H=windowsgui -X main.buildSourceHash=' + $sourceHash
-    & go build -trimpath -ldflags $buildFlags -o $watchdogOutput .
+    & go build -buildvcs=false -trimpath -ldflags $buildFlags -o $watchdogOutput .
     if ($LASTEXITCODE -ne 0) { throw 'Watchdog build failed.' }
     # The MCP transport still uses inherited stdio handles, but the GUI
     # subsystem prevents Windows from allocating a visible console window.
-    & go build -trimpath -ldflags $buildFlags -o $mcpOutput .
+    & go build -buildvcs=false -trimpath -ldflags $buildFlags -o $mcpOutput .
     if ($LASTEXITCODE -ne 0) { throw 'MCP server build failed.' }
 }
 finally {

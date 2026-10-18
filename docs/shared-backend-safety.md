@@ -68,7 +68,7 @@ version label or a ZIP checksum alone does not prove the EXE contains the
 current source. Never distribute a rebuilt script bundle with previous EXEs.
 
 Persistent user routing has been retired. `scripts/launch-codex.ps1` (also
-available as `安全启动Codex.vbs` and the startup manager's `Launch Codex safely`
+available as `安全啟動Codex.vbs` and the startup manager's `Launch Codex safely`
 button) inspects the installed worker's fresh `desktop_launch_mode=process_scoped`
 status, worker identity, shared-server ownership and WebSocket health. It gives
 only the new Desktop process the verified endpoint. Missing, old, stopped or
@@ -221,7 +221,7 @@ recorded in `environment-backup.json`, broadcasts `Environment`, and verifies th
 stopped endpoint was not left in place. It never deletes `CODEX_API_KEY`, chat
 data, state, or logs.
 
-The release also includes `启动管理器.cmd`, `startup-manager.vbs`, and
+The release also includes `啟動管理器.cmd`, `startup-manager.vbs`, and
 `startup-manager.ps1`. The command file hands off to a detached Windows Script
 Host launcher so Explorer double-clicks do not keep a console window in front
 of the graphical manager. It shows

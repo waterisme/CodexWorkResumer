@@ -7,6 +7,85 @@ import (
 	"time"
 )
 
+func TestManagementStateCacheReloadsChangedFile(t *testing.T) {
+	service := newManagementService(t.TempDir())
+	now := time.Now().UTC()
+	initial := newRuntimeState()
+	initial.Threads["first"] = ThreadState{}
+	if err := writeJSONAtomic(service.statePath, initial); err != nil {
+		t.Fatal(err)
+	}
+	got, err := service.loadStateCached(now)
+	if err != nil || len(got.Threads) != 1 {
+		t.Fatalf("initial state unavailable: threads=%d err=%v", len(got.Threads), err)
+	}
+	updated := newRuntimeState()
+	updated.Threads["first"] = ThreadState{}
+	updated.Threads["second"] = ThreadState{}
+	if err := writeJSONAtomic(service.statePath, updated); err != nil {
+		t.Fatal(err)
+	}
+	got, err = service.loadStateCached(now.Add(time.Second))
+	if err != nil || len(got.Threads) != 2 {
+		t.Fatalf("changed state was not reloaded: threads=%d err=%v", len(got.Threads), err)
+	}
+}
+
+func TestManagementStateCacheHasBoundedAge(t *testing.T) {
+	service := newManagementService(t.TempDir())
+	now := time.Now().UTC()
+	initial := newRuntimeState()
+	initial.Threads["first"] = ThreadState{}
+	if err := writeJSONAtomic(service.statePath, initial); err != nil {
+		t.Fatal(err)
+	}
+	got, err := service.loadStateCached(now)
+	if err != nil || len(got.Threads) != 1 {
+		t.Fatalf("initial state unavailable: threads=%d err=%v", len(got.Threads), err)
+	}
+	info, err := os.Stat(service.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := newRuntimeState()
+	updated.Threads["other"] = ThreadState{}
+	if err := writeJSONAtomic(service.statePath, updated); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(service.statePath, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	got, err = service.loadStateCached(now.Add(time.Second))
+	_, stillCached := got.Threads["first"]
+	if err != nil || len(got.Threads) != 1 || !stillCached {
+		t.Fatalf("unchanged file signature bypassed short cache: state=%+v err=%v", got.Threads, err)
+	}
+	got, err = service.loadStateCached(now.Add(managementStateCacheMaxAge))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found := got.Threads["other"]; !found {
+		t.Fatal("bounded reread did not detect same-signature replacement")
+	}
+}
+
+func TestManagementStateCacheDoesNotHideInvalidChangedFile(t *testing.T) {
+	service := newManagementService(t.TempDir())
+	now := time.Now().UTC()
+	if err := writeJSONAtomic(service.statePath, newRuntimeState()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.loadStateCached(now); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(service.statePath, []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.loadStateCached(now.Add(time.Second)); err == nil {
+		t.Fatal("invalid changed state was silently replaced by stale cache")
+	}
+}
+
 func TestManagementTemporarySharedFailureKeepsPreference(t *testing.T) {
 	service := newManagementService(t.TempDir())
 	cfg := defaultConfig()
@@ -74,6 +153,81 @@ func TestManagementSnapshotIncludesIndependentCountdowns(t *testing.T) {
 		snapshot.Retries[0].ConsecutiveRetry != 2 || snapshot.Retries[1].SecondsRemaining != 6 ||
 		snapshot.Retries[1].RecoveryAttempt != 4 || snapshot.Retries[1].ConsecutiveRetry != 1 {
 		t.Fatalf("queue state or countdown is incorrect: %+v", snapshot.Retries)
+	}
+}
+
+func TestManagementSnapshotIncludesPrivacySafeDiagnostics(t *testing.T) {
+	dataDir := t.TempDir()
+	service := newManagementService(dataDir)
+	now := time.Date(2026, 9, 21, 8, 0, 0, 0, time.UTC)
+	state := newRuntimeState()
+	state.Threads["019f9d5d-9c82-75b1-b7c0-20a658af0423"] = ThreadState{Pending: &PendingRetry{
+		Class: classServer, DueAt: now.Add(time.Minute), Attempt: 1, MaxAttempts: 5,
+	}}
+	if err := writeJSONAtomic(service.statePath, state); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(service.statusPath, StatusSnapshot{
+		Version: appVersion, Running: true, PID: os.Getpid(), StartedAt: now.Add(-2 * time.Hour),
+		LastHeartbeatAt: now, LastScanAt: now.Add(-time.Second), WatchedRoots: 2,
+		ControllerState: "ready", LastError: `open C:\Users\Person\private\status.json: access denied`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setDebugMode(filepath.Join(dataDir, diagnosticSettingsFileName), true, now); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := service.snapshot(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := snapshot.Diagnostics
+	if diagnostic.ServiceState != "running" || diagnostic.AppServerConnection != "connected" ||
+		diagnostic.UptimeSeconds != int64((2*time.Hour)/time.Second) || diagnostic.RecoveryTaskCount != 1 ||
+		diagnostic.WatchedRoots != 2 || diagnostic.RecentError != "status_write" || !diagnostic.DebugEnabled ||
+		diagnostic.LogMaxBytes != maxLogBytes || diagnostic.LogFileCount != maxLogFiles || diagnostic.NextResumeAt == "" {
+		t.Fatalf("unexpected diagnostics: %+v", diagnostic)
+	}
+}
+
+func TestManagementSnapshotIncludesTaskMetadataWithoutConversationContent(t *testing.T) {
+	dataDir := t.TempDir()
+	service := newManagementService(dataDir)
+	now := time.Date(2026, 9, 20, 4, 5, 0, 0, time.UTC)
+	threadID := "019f9d5d-9c82-75b1-b7c0-20a658af0423"
+	rolloutPath := filepath.Join(dataDir, "rollout-test.jsonl")
+	payload := syntheticSettingsPayload("gpt-5.6-sol", "high", "private-content")
+	payload["cwd"] = `C:\Projects\CodexWorkResumer`
+	if err := os.WriteFile(rolloutPath, marshalSyntheticTurnContext(t, payload), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	state := newRuntimeState()
+	state.Threads[threadID] = ThreadState{
+		LastExternalTurnAt: now.Add(-2 * time.Minute),
+		Pending: &PendingRetry{
+			Class: classServer, DueAt: now.Add(time.Minute), RolloutPath: rolloutPath,
+			Attempt: 1, MaxAttempts: 15,
+		},
+	}
+	if err := writeJSONAtomic(service.statePath, state); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONAtomic(service.statusPath, StatusSnapshot{
+		Version: appVersion, Running: true, PID: os.Getpid(), LastScanAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := service.snapshot(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Retries) != 1 {
+		t.Fatalf("task metadata retry count = %d, want 1", len(snapshot.Retries))
+	}
+	retry := snapshot.Retries[0]
+	if retry.Label != "CodexWorkResumer · "+shortThreadID(threadID) || retry.ProjectPath != `C:\Projects\CodexWorkResumer` ||
+		retry.TaskType != "Codex" || retry.LastActivityAt != now.Add(-2*time.Minute).Format(time.RFC3339Nano) {
+		t.Fatalf("task metadata is incomplete: %+v", retry)
 	}
 }
 
@@ -290,7 +444,8 @@ func TestManagementUpdatesCombinedLocalSettingsAndPause(t *testing.T) {
 		DelayStrategy:         delayStrategyExponential,
 		ShowNotifications:     true,
 	}
-	if err := service.setLocalSettings(settings, true, time.Now().UTC()); err != nil {
+	monitoringPaused := false
+	if err := service.setLocalSettings(settings, true, &monitoringPaused, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := service.snapshot(time.Now().UTC())
@@ -301,6 +456,31 @@ func TestManagementUpdatesCombinedLocalSettingsAndPause(t *testing.T) {
 		snapshot.DelayStrategy != delayStrategyExponential || snapshot.InitialDelaySeconds != 6 ||
 		snapshot.MaxDelaySeconds != 90 || snapshot.DelayIncrementSeconds != 3 || !snapshot.ShowNotifications {
 		t.Fatalf("combined local settings did not round trip: %+v", snapshot)
+	}
+}
+
+func TestLocalSettingsWithoutMonitoringFieldPreserveCurrentPause(t *testing.T) {
+	service := newManagementService(t.TempDir())
+	now := time.Date(2026, 9, 21, 10, 0, 0, 0, time.UTC)
+	if _, err := saveMonitoringPaused(service.controlPath, true, now); err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadOrCreateConfig(service.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := RetrySettings{
+		RetryPrompt: config.RetryPrompt, MaxConsecutiveRetries: config.MaxConsecutiveRetries,
+		MaxRecoveryAttempts: config.MaxRecoveryAttempts, InitialDelaySeconds: config.InitialDelaySeconds,
+		MaxDelaySeconds: config.MaxDelaySeconds, DelayIncrementSeconds: config.DelayIncrementSeconds,
+		DelayStrategy: config.DelayStrategy, ShowNotifications: config.ShowNotifications,
+	}
+	if err := service.setLocalSettings(settings, false, nil, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := service.snapshot(now.Add(2 * time.Second))
+	if err != nil || !snapshot.MonitoringPaused {
+		t.Fatalf("legacy settings save cleared monitoring pause: snapshot=%+v err=%v", snapshot, err)
 	}
 }
 
@@ -324,6 +504,10 @@ func TestManagementUpdatesPromptAndQueuesControls(t *testing.T) {
 	paused, err := service.setPaused(true, now)
 	if err != nil || !paused.Paused {
 		t.Fatalf("pause was not updated: snapshot=%+v err=%v", paused, err)
+	}
+	monitoringPaused, err := service.setMonitoringPaused(true, now.Add(time.Second))
+	if err != nil || !monitoringPaused.MonitoringPaused || !monitoringPaused.Paused {
+		t.Fatalf("monitoring pause was not independent: snapshot=%+v err=%v", monitoringPaused, err)
 	}
 	if _, err := service.retryNow(threadID, now); err != nil {
 		t.Fatal(err)

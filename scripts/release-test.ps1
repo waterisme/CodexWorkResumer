@@ -8,13 +8,13 @@ Set-StrictMode -Version 2
 
 $archive = (Resolve-Path -LiteralPath $ArchivePath).Path
 $testRoot = Join-Path $env:TEMP ('codex-auto-retry-release-test-' + [guid]::NewGuid().ToString('N'))
-$installLauncher = ([string][char]0x5b89) + ([char]0x88c5) + '.cmd'
-$uninstallLauncher = ([string][char]0x5378) + ([char]0x8f7d) + '.cmd'
-$installReadme = 'README-' + ([char]0x5b89) + ([char]0x88c5) + ([char]0x8bf4) + ([char]0x660e) + '.txt'
-$startupManagerLauncher = ([string][char]0x542f) + ([char]0x52a8) + ([char]0x7ba1) + ([char]0x7406) + ([char]0x5668) + '.cmd'
+$installLauncher = ([string][char]0x5b89) + ([char]0x88dd) + '.cmd'
+$uninstallLauncher = ([string][char]0x5378) + ([char]0x8f09) + '.cmd'
+$installReadme = 'README-' + ([char]0x5b89) + ([char]0x88dd) + ([char]0x8aaa) + ([char]0x660e) + '.txt'
+$startupManagerLauncher = ([string][char]0x555f) + ([char]0x52d5) + ([char]0x7ba1) + ([char]0x7406) + ([char]0x5668) + '.cmd'
 $safeDisableLauncher = ([string][char]0x5b89) + ([char]0x5168) + ([char]0x505c) + ([char]0x7528) + '.cmd'
 $startupManagerVbs = 'startup-manager.vbs'
-$safeCodexLauncher = ([string][char]0x5b89) + ([char]0x5168) + ([char]0x542f) + ([char]0x52a8) + 'Codex.vbs'
+$safeCodexLauncher = ([string][char]0x5b89) + ([char]0x5168) + ([char]0x555f) + ([char]0x52d5) + 'Codex.vbs'
 
 function Get-PeSubsystem {
     param([string]$Path)
@@ -79,11 +79,14 @@ try {
         'SHA256SUMS.txt',
         'payload\codex-auto-retry\.codex-plugin\plugin.json',
         'payload\codex-auto-retry\.mcp.json',
+        'payload\codex-auto-retry\README_zh-TW.md',
+        'payload\codex-auto-retry\THIRD_PARTY_LICENSES.txt',
         'payload\codex-auto-retry\scripts\source\ui\settings.ps1',
         'payload\codex-auto-retry\scripts\environment.ps1',
         'payload\codex-auto-retry\scripts\launch-codex.ps1',
         'payload\codex-auto-retry\scripts\launch-codex-smoke-test.ps1',
         'payload\codex-auto-retry\scripts\install-routing-smoke-test.ps1',
+        'payload\codex-auto-retry\scripts\startup-manager-i18n.json',
         'payload\codex-auto-retry\scripts\startup-approval.ps1',
         'payload\codex-auto-retry\scripts\shared-server-status.ps1',
         'payload\codex-auto-retry\scripts\path-safety.ps1',
@@ -108,10 +111,12 @@ try {
 
     $archiveEntries = @(tar.exe -tf $archive)
     $privateRuntimeEntries = @($archiveEntries | Where-Object {
-        $_ -match '(^|/)(config|control|state|status)\.json$' -or
+        $_ -match '(^|/)(config|control|state|status|task-plan)\.json$' -or
         $_ -match '(^|/)logs/' -or
         $_ -match '(^|/)node_modules/' -or
-        $_ -match '(^|/)\.git/'
+        $_ -match '(^|/)\.go-test-tmp/' -or
+        $_ -match '(^|/)\.git/' -or
+        $_ -match '\.(?:pptx|png|jpe?g)$'
     })
     if ($privateRuntimeEntries.Count -gt 0) {
         throw "Release contains runtime state or build dependencies: $($privateRuntimeEntries -join ', ')"
@@ -378,14 +383,10 @@ try {
         -SkipRuntimeInstall 2>&1 | Out-String)
         $isolatedExit = $LASTEXITCODE
     } finally { $ErrorActionPreference = $savedPreference }
-    $directMcpInstall = 'passed'
     if ($isolatedExit -ne 0) {
-        if ($installOutput -notmatch 'Close Codex completely before installing or upgrading' -or
-            (Test-Path -LiteralPath (Join-Path $testProfile 'plugins\codex-auto-retry'))) {
-            throw "Isolated installer test failed:`n$installOutput"
-        }
-        $directMcpInstall = 'blocked_by_live_desktop; no plugin files changed'
-    } else {
+        throw "Isolated official-backend installation should work while Codex is open:`n$installOutput"
+    }
+    $directMcpInstall = 'passed_with_live_codex_allowed'
     $installedMcpConfig = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $testProfile 'plugins\codex-auto-retry\.mcp.json') | ConvertFrom-Json
     $installedMcpServer = $installedMcpConfig.mcpServers.'codex-auto-retry'
     $installedMcpArgs = @($installedMcpServer.args)
@@ -393,7 +394,6 @@ try {
     if (-not (Test-ReleasePathEquals -Actual ([string]$installedMcpServer.command) -Expected $expectedMcpCommand) -or
         $installedMcpArgs.Count -ne 1 -or [string]$installedMcpArgs[0] -ne 'mcp') {
         throw "Installed plugin did not replace the shell wrapper with the direct MCP launcher. Actual command: $([string]$installedMcpServer.command); expected: $expectedMcpCommand; args: $($installedMcpArgs -join ',')"
-    }
     }
 
     [pscustomobject]@{
@@ -407,7 +407,7 @@ try {
         StartupManager = 'verified'
         FailOpenInstallGuard = 'present'
         RuntimePathGuard = 'verified'
-        Status = if ($isolatedExit -eq 0) { 'release verified' } else { 'package verified; live installation not tested' }
+        Status = 'release verified'
     }
 }
 finally {

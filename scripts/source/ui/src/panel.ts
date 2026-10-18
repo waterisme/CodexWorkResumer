@@ -30,6 +30,9 @@ type FailureClass =
 type ManagedRetry = {
   thread_id: string;
   label: string;
+  project_path?: string;
+  task_type: "Codex" | "Work";
+  last_activity_at?: string;
   state: "pending" | "starting" | "running" | "stopped";
   class: FailureClass;
   due_at?: string;
@@ -45,13 +48,34 @@ type ManagedRetry = {
   stop_reason?: string;
 };
 
+type UsageWindow = {
+  used_percent: number;
+  remaining_percent: number;
+  window_duration_mins: number;
+  resets_at: number;
+};
+
+type UsageSnapshot = {
+  adapter: "codex" | "work";
+  available: boolean;
+  source?: string;
+  fetched_at?: string;
+  observed_at?: string;
+  unavailable_reason?: string;
+  five_hour?: UsageWindow;
+  weekly?: UsageWindow;
+};
+
 type ManagementSnapshot = {
   version: string;
+  build: number;
   running: boolean;
   heartbeat_stale: boolean;
   paused: boolean;
+  monitoring_paused: boolean;
   shared_app_server_enabled: boolean;
   shared_app_server_requested?: boolean;
+  cli_resume_fallback_enabled: boolean;
   desktop_transport?: "official_stdio" | "shared_websocket" | "stopped" | "unknown";
   recovery_mode?: "shared_websocket" | "safe_launcher_required" | "none";
   automatic_recovery_supported?: boolean;
@@ -64,6 +88,8 @@ type ManagementSnapshot = {
   max_delay_seconds: number;
   delay_increment_seconds: number;
   delay_strategy: "fixed" | "linear" | "exponential";
+  resume_interval_seconds: number;
+  usage_refresh_minutes: number;
   show_notifications: boolean;
   memory_limit_mb: number;
   memory_usage_mb?: number;
@@ -78,10 +104,12 @@ type ManagementSnapshot = {
   pending_retries: number;
   active_retries: number;
   stopped_retries: number;
+  rate_limited_retries: number;
   watched_roots: number;
   controller_state?: string;
   last_error?: string;
   notice?: string;
+  codex_usage: UsageSnapshot;
   retries: ManagedRetry[];
 };
 
@@ -101,15 +129,30 @@ const elements = {
   notice: required<HTMLElement>("notice"),
   queueCount: required<HTMLElement>("queue-count"),
   nextRetry: required<HTMLElement>("next-retry"),
+  usageSummary: required<HTMLElement>("usage-summary"),
+  usageFiveHourRow: required<HTMLElement>("usage-5h-row"),
+  usageFiveHourBar: required<HTMLElement>("usage-5h-bar"),
+  usageFiveHourRemaining: required<HTMLElement>("usage-5h-remaining"),
+  usageFiveHourCountdown: required<HTMLElement>("usage-5h-countdown"),
+  usageWeeklyRow: required<HTMLElement>("usage-weekly-row"),
+  usageWeeklyBar: required<HTMLElement>("usage-weekly-bar"),
+  usageWeeklyRemaining: required<HTMLElement>("usage-weekly-remaining"),
+  usageWeeklyCountdown: required<HTMLElement>("usage-weekly-countdown"),
   queueSummary: required<HTMLElement>("queue-summary"),
   queueList: required<HTMLElement>("queue-list"),
+  selectAllTasks: required<HTMLInputElement>("select-all-tasks"),
+  resumeSelected: required<HTMLButtonElement>("resume-selected"),
+  resumeSelectedLabel: required<HTMLElement>("resume-selected-label"),
   scanTime: required<HTMLElement>("scan-time"),
   pauseToggle: required<HTMLInputElement>("pause-toggle"),
+  monitoringToggle: required<HTMLInputElement>("monitoring-toggle"),
   sharedAppServerToggle: required<HTMLInputElement>("shared-app-server-toggle"),
   sharedAppServerDescription: required<HTMLElement>("shared-app-server-description"),
   sharedAppServerPort: required<HTMLElement>("shared-app-server-port"),
+  cliFallbackToggle: required<HTMLInputElement>("cli-fallback-toggle"),
   startupApprovalStatus: required<HTMLElement>("startup-approval-status"),
   pauseDescription: required<HTMLElement>("pause-description"),
+  monitoringDescription: required<HTMLElement>("monitoring-description"),
   retryPrompt: required<HTMLTextAreaElement>("retry-prompt"),
   promptCount: required<HTMLElement>("prompt-count"),
   promptError: required<HTMLElement>("prompt-error"),
@@ -117,6 +160,8 @@ const elements = {
   maxRecoveryAttempts: required<HTMLInputElement>("max-recovery-attempts"),
   maxConsecutiveRetries: required<HTMLInputElement>("max-consecutive-retries"),
   memoryLimit: required<HTMLInputElement>("memory-limit-mb"),
+  resumeInterval: required<HTMLInputElement>("resume-interval-seconds"),
+  usageRefresh: required<HTMLInputElement>("usage-refresh-minutes"),
   delayStrategies: requiredAll<HTMLInputElement>('input[name="delay-strategy"]'),
   initialDelayLabel: required<HTMLElement>("initial-delay-label"),
   initialDelay: required<HTMLInputElement>("initial-delay"),
@@ -135,6 +180,7 @@ let savedSettings = "";
 let busyCount = 0;
 let noticeTimer = 0;
 let statusPollInFlight = false;
+const selectedTaskIds = new Set<string>();
 
 function required<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
@@ -177,7 +223,7 @@ function render(next: ManagementSnapshot): void {
   const keepSettingsDraft = snapshot !== null && currentSettings() !== savedSettings;
   snapshot = next;
   savedPrompt = next.retry_prompt;
-  elements.version.textContent = next.version ? `v${next.version}` : "";
+  elements.version.textContent = next.version ? `v${next.version}${next.build > 0 ? ` (Build ${next.build})` : ""}` : "";
   elements.retryPrompt.disabled = false;
   elements.pauseToggle.disabled = false;
   elements.sharedAppServerToggle.disabled = false;
@@ -186,99 +232,183 @@ function render(next: ManagementSnapshot): void {
     elements.maxRecoveryAttempts.value = String(next.max_recovery_attempts);
     elements.maxConsecutiveRetries.value = String(next.max_consecutive_retries);
     elements.memoryLimit.value = String(next.memory_limit_mb);
+    elements.resumeInterval.value = String(next.resume_interval_seconds);
+    elements.usageRefresh.value = String(next.usage_refresh_minutes);
     elements.initialDelay.value = String(next.initial_delay_seconds);
     elements.maxDelay.value = String(next.max_delay_seconds);
     elements.delayIncrement.value = String(next.delay_increment_seconds);
     for (const option of elements.delayStrategies) option.checked = option.value === next.delay_strategy;
     elements.notificationsToggle.checked = next.show_notifications;
+    elements.cliFallbackToggle.checked = next.cli_resume_fallback_enabled;
   }
   savedSettings = serializedSettings(next);
   elements.pauseToggle.checked = !next.paused;
+  elements.monitoringToggle.checked = !next.monitoring_paused;
   elements.sharedAppServerToggle.checked = next.shared_app_server_requested ?? next.shared_app_server_enabled;
   elements.sharedAppServerDescription.textContent = next.shared_app_server_enabled
-    ? `正在使用插件拥有且已通过健康检查的后台（端口 ${next.shared_app_server_port}）`
-    : next.shared_app_server_requested ? "共享后台暂不可用，启用偏好已保留；安全启动入口会尝试恢复" : "默认关闭，不影响 Codex 官方后台";
-  elements.sharedAppServerPort.textContent = next.shared_app_server_port > 0 ? `端口 ${next.shared_app_server_port}` : "";
+    ? `正在使用已通過健康檢查的 Codex自動續跑助手（連接埠 ${next.shared_app_server_port}）`
+    : next.shared_app_server_requested ? "Codex自動續跑助手暫時無法使用，啟用偏好已保留；安全啟動入口會嘗試恢復" : "預設關閉；關閉時仍可查看額度";
+  elements.sharedAppServerPort.textContent = next.shared_app_server_port > 0 ? `連接埠 ${next.shared_app_server_port}` : "";
   const startupApprovalLabels: Record<ManagementSnapshot["startup_approved"], string> = {
-    enabled: "Windows 登录启动：已启用",
-    disabled: "Windows 登录启动：已禁用",
-    unknown: "Windows 登录启动：状态未知",
+    enabled: "Windows 登入啟動：已啟用",
+    disabled: "Windows 登入啟動：已停用",
+    unknown: "Windows 登入啟動：狀態未知",
   };
   elements.startupApprovalStatus.textContent = startupApprovalLabels[next.startup_approved] ?? startupApprovalLabels.unknown;
   elements.startupApprovalStatus.dataset.state = next.startup_approved;
   updatePromptState();
   renderService(next);
   renderMetrics(next);
+  renderUsage(next.codex_usage);
   renderQueue(next);
   renderScanTime(next);
   if (next.notice) showNotice(next.notice, false);
   refreshIcons();
 }
 
+function renderUsage(usage: UsageSnapshot | undefined): void {
+  renderUsageWindow(
+    usage?.available ? usage.five_hour : undefined,
+    elements.usageFiveHourRow,
+    elements.usageFiveHourBar,
+    elements.usageFiveHourRemaining,
+    elements.usageFiveHourCountdown,
+  );
+  renderUsageWindow(
+    usage?.available ? usage.weekly : undefined,
+    elements.usageWeeklyRow,
+    elements.usageWeeklyBar,
+    elements.usageWeeklyRemaining,
+    elements.usageWeeklyCountdown,
+  );
+  if (!usage?.available || !(usage.observed_at ?? usage.fetched_at)) {
+    elements.usageSummary.textContent = "N/A";
+    return;
+  }
+  const fetched = new Date(usage.observed_at ?? usage.fetched_at ?? "");
+  elements.usageSummary.textContent = Number.isFinite(fetched.getTime())
+    ? `更新於 ${fetched.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`
+    : "已取得最新資料";
+}
+
+function renderUsageWindow(
+  windowValue: UsageWindow | undefined,
+  row: HTMLElement,
+  bar: HTMLElement,
+  remaining: HTMLElement,
+  countdown: HTMLElement,
+): void {
+  if (!windowValue || !Number.isFinite(windowValue.used_percent) || !Number.isFinite(windowValue.remaining_percent)
+    || !Number.isFinite(windowValue.resets_at) || windowValue.resets_at <= 0) {
+    remaining.textContent = "N/A";
+    countdown.textContent = "N/A";
+    bar.style.width = "0%";
+    row.classList.remove("usage-low", "usage-critical", "usage-empty");
+    delete countdown.dataset.dueAt;
+    delete countdown.dataset.countdownStyle;
+    countdown.removeAttribute("title");
+    return;
+  }
+  const remainingPercent = Math.max(0, Math.min(100, windowValue.remaining_percent));
+  remaining.textContent = `剩餘 ${formatPercent(remainingPercent)}%`;
+  bar.style.width = `${remainingPercent}%`;
+  row.classList.toggle("usage-low", remainingPercent > 5 && remainingPercent <= 20);
+  row.classList.toggle("usage-critical", remainingPercent > 0 && remainingPercent <= 5);
+  row.classList.toggle("usage-empty", remainingPercent <= 0);
+  const resetAt = new Date(windowValue.resets_at * 1000);
+  countdown.title = `Reset：${resetAt.toLocaleString([], {
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  })}`;
+  countdown.dataset.dueAt = resetAt.toISOString();
+  countdown.dataset.countdownStyle = "quota";
+  updateCountdownElement(countdown);
+}
+
+function formatPercent(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1).replace(/\.0$/, "");
+}
+
 function renderService(next: ManagementSnapshot): void {
   const dot = document.createElement("span");
   dot.className = "status-dot";
-  let label = "未运行";
-  let detail = "未检测到有效心跳";
-  if (next.controller_state === "memory_limit_exceeded") {
-    label = "内存保护已停止";
-    detail = `后台内存 ${next.memory_usage_mb ?? 0} MB，已超过上限 ${next.memory_limit_mb} MB`;
+  let label = "未執行";
+  let detail = "未偵測到有效心跳";
+  if (next.running && next.monitoring_paused) {
+    label = "Paused";
+    detail = "Task 掃描與額度更新已暫停，只維持背景 heartbeat";
+    dot.classList.add("status-dot-warning");
+  } else if (next.controller_state === "memory_limit_exceeded") {
+    label = "記憶體保護已停止";
+    detail = `背景服務記憶體 ${next.memory_usage_mb ?? 0} MB，已超過上限 ${next.memory_limit_mb} MB`;
     dot.classList.add("status-dot-danger");
+  } else if (
+    next.running &&
+    next.cli_resume_fallback_enabled &&
+    ["shared_app_server_disabled", "codex_restart_required", "codex_not_running", "codex_app_not_ready"].includes(next.controller_state ?? "")
+  ) {
+    label = "背景 CLI 備援待命";
+    detail = "正式恢復通道不可用時，可在背景繼續同一 Session；結果不會回到原 Codex 視窗";
+    dot.classList.add("status-dot-positive");
   } else if (next.running && next.controller_state === "codex_restart_required") {
-    label = "Codex 未接入共享后台";
-    detail = "共享后台已启动，但当前 Codex 仍使用官方后台；请使用安全启动 Codex 入口";
+    label = "Codex 未接入 Codex自動續跑助手";
+    detail = "Codex自動續跑助手已啟動，但目前 Codex 仍使用官方後台；請使用安全啟動 Codex 入口";
     dot.classList.add("status-dot-warning");
   } else if (next.running && next.controller_state === "official_ipc_ready") {
-    label = "Codex 已接入官方恢复通道";
-    detail = "新版 Codex 使用官方 IPC，自动恢复请求会转交当前任务所有者";
+    label = "Codex 已接入官方恢復通道";
+    detail = "新版 Codex 使用官方 IPC，自動恢復要求會轉交目前 Task 的擁有者";
     dot.classList.add("status-dot-positive");
   } else if (next.running && next.controller_state === "codex_not_running") {
     label = "Codex 已退出";
-    detail = "相关任务已停止自动重试；启动 Codex 后可手动重新开始";
+    detail = "相關 Task 已停止自動重試；啟動 Codex 後可手動重新開始";
     dot.classList.add("status-dot-danger");
   } else if (next.running && next.controller_state === "shared_app_server_disabled") {
-    label = next.shared_app_server_requested ? "共享后台暂不可用" : "共享后台已关闭";
-    detail = "Codex 继续使用官方后台；打开共享后台后才会执行静默恢复";
+    label = next.shared_app_server_requested ? "Codex自動續跑助手暫時無法使用" : "Codex自動續跑助手已關閉";
+    detail = "Codex 繼續使用官方後台；開啟 Codex自動續跑助手後才會執行靜默恢復";
     dot.classList.add("status-dot-warning");
   } else if (next.running && next.controller_state === "shared_app_server_port_reserved") {
-    label = "端口被 Windows 保留";
-    detail = "共享后台未启动，自动重试已停止；更换端口后再启用共享后台";
+    label = "連接埠被 Windows 保留";
+    detail = "Codex自動續跑助手未啟動，自動重試已停止；更換連接埠後再啟用";
     dot.classList.add("status-dot-danger");
   } else if (next.running && next.controller_state === "shared_app_server_port_conflict") {
-    label = "共享端口正在迁移";
-    detail = `首选端口不可用；启用共享后台时会选择安全的本机端口（当前配置 ${next.shared_app_server_port}）`;
+    label = "本機連接埠正在遷移";
+    detail = `首選連接埠無法使用；啟用 Codex自動續跑助手時會選擇安全的本機連接埠（目前設定 ${next.shared_app_server_port}）`;
     dot.classList.add("status-dot-danger");
   } else if (next.running && next.controller_state === "shared_app_server_migration_deferred") {
-    label = "等待 Codex 关闭";
-    detail = "共享后台清理或迁移已延后，避免中断当前 Codex 会话";
+    label = "等待 Codex 關閉";
+    detail = "Codex自動續跑助手清理或遷移已延後，避免中斷目前 Codex 工作階段";
     dot.classList.add("status-dot-warning");
   } else if (next.running && next.controller_state === "shared_app_server_environment_conflict") {
-    label = "共享后台环境冲突";
-    detail = "检测到 CODEX_APP_SERVER_WS_URL 已指向其他地址，插件未覆盖；请清理冲突值后再启用共享后台";
+    label = "Codex自動續跑助手環境衝突";
+    detail = "偵測到 CODEX_APP_SERVER_WS_URL 已指向其他位址，程式未覆寫；請清理衝突值後再啟用";
     dot.classList.add("status-dot-danger");
   } else if (next.running && next.controller_state === "shared_app_server_ownership_unknown") {
-    label = "共享后台归属未知";
-    detail = "插件无法确认后台进程归属，已停止自动清理；请先关闭 Codex 并人工核对后再恢复共享后台";
+    label = "Codex自動續跑助手歸屬未知";
+    detail = "程式無法確認背景程序歸屬，已停止自動清理；請先關閉 Codex 並人工核對後再恢復";
     dot.classList.add("status-dot-danger");
   } else if (next.running && next.controller_state === "shared_app_server_config_invalid") {
-    label = "共享后台配置不兼容";
-    detail = "已自动切回 Codex 官方后台，避免错误配置继续影响对话";
+    label = "Codex自動續跑助手設定不相容";
+    detail = "已自動切回 Codex 官方後台，避免錯誤設定繼續影響對話";
     dot.classList.add("status-dot-danger");
   } else if (next.running && next.controller_state === "shared_app_server_memory_limit_exceeded") {
-    label = "共享后台内存保护";
-    detail = `共享后台已停止接管（${next.shared_app_server_memory_usage_mb ?? 0} MB/${next.shared_app_server_memory_limit_mb ?? 0} MB），未强制关闭 Codex`;
+    label = "Codex自動續跑助手記憶體保護";
+    detail = `Codex自動續跑助手已停止接管（${next.shared_app_server_memory_usage_mb ?? 0} MB/${next.shared_app_server_memory_limit_mb ?? 0} MB），未強制關閉 Codex`;
     dot.classList.add("status-dot-warning");
   } else if (next.running && next.controller_state && !["ready", "starting", "official_ipc_ready"].includes(next.controller_state)) {
-    label = "恢复通道异常";
-    detail = `自动重试已停止继续空转：${controllerStateLabel(next.controller_state)}`;
+    label = "恢復通道異常";
+    detail = `自動重試已停止持續空轉：${controllerStateLabel(next.controller_state)}`;
     dot.classList.add("status-dot-danger");
+  } else if (next.running && next.rate_limited_retries > 0) {
+    label = "Rate Limited";
+    detail = `${next.rate_limited_retries} 個 Task 正等待額度重設；到期後會重新確認再 Resume`;
+    dot.classList.add("status-dot-warning");
   } else if (next.running && next.paused) {
-    label = "已暂停";
-    detail = "监控保持运行，新重试暂不执行";
+    label = "已暫停";
+    detail = "監控維持執行，新的重試暫不執行";
     dot.classList.add("status-dot-warning");
   } else if (next.running) {
-    label = "运行中";
-    detail = `正在监控 ${next.watched_roots} 个会话位置`;
+    label = "執行中";
+    detail = `正在監控 ${next.watched_roots} 個工作階段位置`;
     dot.classList.add("status-dot-positive");
   } else {
     dot.classList.add("status-dot-danger");
@@ -286,18 +416,19 @@ function renderService(next: ManagementSnapshot): void {
   elements.serviceStatus.replaceChildren(dot, document.createTextNode(label));
   elements.serviceLine.textContent = detail;
   if (next.running && next.automatic_recovery_supported === false && next.recovery_capability_reason === "official_stdio_not_externally_controllable") {
-    elements.serviceLine.textContent = `${detail}；当前为只监控模式，尚未发送自动恢复请求`;
+    elements.serviceLine.textContent = `${detail}；目前為僅監控模式，尚未傳送自動恢復要求`;
   }
   if (next.memory_guard_triggered) {
-    elements.serviceLine.textContent = `${detail}；内存保护已触发（${next.memory_usage_mb ?? 0} MB/${next.memory_limit_mb} MB）`;
+    elements.serviceLine.textContent = `${detail}；記憶體保護已觸發（${next.memory_usage_mb ?? 0} MB/${next.memory_limit_mb} MB）`;
   }
   if (next.shared_app_server_memory_guard_triggered) {
-    elements.serviceLine.textContent = `${elements.serviceLine.textContent}；共享后台内存保护已触发（${next.shared_app_server_memory_usage_mb ?? 0} MB/${next.shared_app_server_memory_limit_mb ?? 0} MB），未强制关闭 Codex`;
+    elements.serviceLine.textContent = `${elements.serviceLine.textContent}；Codex自動續跑助手記憶體保護已觸發（${next.shared_app_server_memory_usage_mb ?? 0} MB/${next.shared_app_server_memory_limit_mb ?? 0} MB），未強制關閉 Codex`;
   }
   if (next.retry_safety_warning) {
     elements.serviceLine.textContent = `${elements.serviceLine.textContent}；${next.retry_safety_warning}`;
   }
-  elements.pauseDescription.textContent = next.paused ? "已暂停新重试" : "运行中";
+  elements.pauseDescription.textContent = next.paused ? "已暫停新的重試" : "執行中";
+  elements.monitoringDescription.textContent = next.monitoring_paused ? "監控已暫停" : "監控中";
 }
 
 function renderMetrics(next: ManagementSnapshot): void {
@@ -306,43 +437,65 @@ function renderMetrics(next: ManagementSnapshot): void {
   const pending = next.retries
     .filter((retry) => retry.state === "pending" && retry.due_at)
     .sort((a, b) => Date.parse(a.due_at ?? "") - Date.parse(b.due_at ?? ""));
-  if (next.paused && pending.length > 0) {
-    elements.nextRetry.textContent = "等待恢复";
+  if (next.monitoring_paused) {
+    elements.nextRetry.textContent = "監控已暫停";
+    delete elements.nextRetry.dataset.dueAt;
+  } else if (next.paused && pending.length > 0) {
+    elements.nextRetry.textContent = "等待恢復";
   } else if (pending.length > 0) {
     elements.nextRetry.dataset.dueAt = pending[0].due_at ?? "";
     updateCountdownElement(elements.nextRetry);
   } else if (next.active_retries > 0) {
-    elements.nextRetry.textContent = "正在重试";
+    elements.nextRetry.textContent = "正在重試";
     delete elements.nextRetry.dataset.dueAt;
   } else {
     elements.nextRetry.textContent = "--";
     delete elements.nextRetry.dataset.dueAt;
   }
   if (total === 0) {
-    elements.queueSummary.textContent = "当前没有等待中的任务";
+    elements.queueSummary.textContent = "目前沒有等待中的 Task";
   } else {
-    elements.queueSummary.textContent = `${next.pending_retries} 个等待中，${next.active_retries} 个执行中，${next.stopped_retries} 个已停止`;
+    elements.queueSummary.textContent = `${next.pending_retries} 個等待中，${next.active_retries} 個執行中，${next.stopped_retries} 個已停止`;
   }
 }
 
 function renderQueue(next: ManagementSnapshot): void {
   elements.queueList.replaceChildren();
+  const selectable = next.retries.filter(canSelectForResume);
+  const selectableIDs = new Set(selectable.map((retry) => retry.thread_id));
+  for (const threadID of selectedTaskIds) {
+    if (!selectableIDs.has(threadID)) selectedTaskIds.delete(threadID);
+  }
   if (next.retries.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.append(icon("activity"), document.createTextNode("队列为空"));
+    empty.append(icon("activity"), document.createTextNode("佇列為空"));
     elements.queueList.append(empty);
+    updateTaskSelection(next);
     return;
   }
   for (const retry of next.retries) {
-    elements.queueList.append(createQueueItem(retry, next.paused));
+    elements.queueList.append(createQueueItem(retry, next.paused || next.monitoring_paused));
   }
+  updateTaskSelection(next);
 }
 
 function createQueueItem(retry: ManagedRetry, paused: boolean): HTMLElement {
   const row = document.createElement("article");
   row.className = "queue-item";
   row.dataset.threadId = retry.thread_id;
+
+  const selector = document.createElement("input");
+  selector.type = "checkbox";
+  selector.className = "task-selector";
+  selector.checked = selectedTaskIds.has(retry.thread_id);
+  selector.disabled = !canSelectForResume(retry);
+  selector.setAttribute("aria-label", `選取 ${retry.label}`);
+  selector.addEventListener("change", () => {
+    if (selector.checked) selectedTaskIds.add(retry.thread_id);
+    else selectedTaskIds.delete(retry.thread_id);
+    if (snapshot) updateTaskSelection(snapshot);
+  });
 
   const main = document.createElement("div");
   main.className = "queue-main";
@@ -355,26 +508,32 @@ function createQueueItem(retry: ManagedRetry, paused: boolean): HTMLElement {
   title.className = "queue-title";
   title.textContent = retry.label;
   title.title = retry.thread_id;
+  const project = document.createElement("div");
+  project.className = "queue-project";
+  project.textContent = retry.project_path || "專案路徑：N/A";
+  project.title = retry.project_path || "N/A";
   const meta = document.createElement("div");
   meta.className = "queue-meta";
   const recovery = retry.max_recovery_attempts
-    ? `本次故障恢复 ${retry.recovery_attempt}/${retry.max_recovery_attempts}`
-    : `本次故障恢复 ${retry.recovery_attempt}`;
+    ? `本次故障恢復 ${retry.recovery_attempt}/${retry.max_recovery_attempts}`
+    : `本次故障恢復 ${retry.recovery_attempt}`;
   const consecutive = retry.max_consecutive_retries
-    ? `连续无进展 ${retry.consecutive_retry}/${retry.max_consecutive_retries}`
-    : `连续无进展 ${retry.consecutive_retry}`;
+    ? `連續無進展 ${retry.consecutive_retry}/${retry.max_consecutive_retries}`
+    : `連續無進展 ${retry.consecutive_retry}`;
   const stateLabel = retry.state === "pending"
     ? "等待中"
     : retry.state === "stopped"
       ? stoppedStateLabel(retry)
       : actionLabel(retry.action);
   meta.append(
+    textSpan(retry.task_type || "Codex", "task-type"),
     textSpan(classLabel(retry.class)),
     textSpan(recovery),
     textSpan(consecutive),
     textSpan(stateLabel),
+    textSpan(formatLastActivity(retry.last_activity_at)),
   );
-  copy.append(title, meta);
+  copy.append(title, project, meta);
   main.append(queueIcon, copy);
 
   const state = document.createElement("div");
@@ -384,12 +543,12 @@ function createQueueItem(retry: ManagedRetry, paused: boolean): HTMLElement {
   if (retry.state === "pending" && retry.due_at) {
     primary.dataset.dueAt = retry.due_at;
     updateCountdownElement(primary);
-    secondary.textContent = paused ? "恢复后执行" : "后重试";
+    secondary.textContent = paused ? "恢復後執行" : "後重試";
   } else if (retry.state === "stopped") {
     primary.textContent = "已停止";
     secondary.textContent = stopReasonLabel(retry);
   } else {
-    primary.textContent = retry.state === "running" ? "执行中" : "启动中";
+    primary.textContent = retry.state === "running" ? "執行中" : "啟動中";
     secondary.textContent = actionLabel(retry.action);
   }
   state.append(primary, secondary);
@@ -397,16 +556,30 @@ function createQueueItem(retry: ManagedRetry, paused: boolean): HTMLElement {
   const actions = document.createElement("div");
   actions.className = "queue-actions";
   if (retry.can_retry_now) {
-    actions.append(actionButton("play", "立即重试", "retry-action", () => runThreadAction("retry_now", retry.thread_id)));
+    actions.append(actionButton("play", "立即重試", "retry-action", () => runThreadAction("retry_now", retry.thread_id)));
   }
   if (retry.can_cancel) {
-    actions.append(actionButton("x", "取消这次重试", "cancel-action", () => runThreadAction("cancel_retry", retry.thread_id)));
+    actions.append(actionButton("x", "取消這次重試", "cancel-action", () => runThreadAction("cancel_retry", retry.thread_id)));
   }
   if (retry.can_restart) {
-    actions.append(actionButton("rotate-ccw", "重新开始计数并重试", "retry-action", () => runThreadAction("restart_retry", retry.thread_id)));
+    actions.append(actionButton("rotate-ccw", "重新開始計數並重試", "retry-action", () => runThreadAction("restart_retry", retry.thread_id)));
   }
-  row.append(main, state, actions);
+  row.append(selector, main, state, actions);
   return row;
+}
+
+function canSelectForResume(retry: ManagedRetry): boolean {
+  return retry.can_retry_now || retry.can_restart;
+}
+
+function updateTaskSelection(next: ManagementSnapshot): void {
+  const selectable = next.retries.filter(canSelectForResume);
+  const selectedCount = selectable.filter((retry) => selectedTaskIds.has(retry.thread_id)).length;
+  elements.selectAllTasks.disabled = selectable.length === 0 || busyCount > 0;
+  elements.selectAllTasks.checked = selectable.length > 0 && selectedCount === selectable.length;
+  elements.selectAllTasks.indeterminate = selectedCount > 0 && selectedCount < selectable.length;
+  elements.resumeSelected.disabled = selectedCount === 0 || busyCount > 0;
+  elements.resumeSelectedLabel.textContent = selectedCount > 0 ? `Resume 已選擇（${selectedCount}）` : "Resume 已選擇";
 }
 
 function actionButton(iconName: string, label: string, className: string, action: () => void): HTMLButtonElement {
@@ -427,10 +600,20 @@ function icon(name: string): HTMLElement {
   return element;
 }
 
-function textSpan(value: string): HTMLElement {
+function textSpan(value: string, className = ""): HTMLElement {
   const span = document.createElement("span");
   span.textContent = value;
+  if (className) span.className = className;
   return span;
+}
+
+function formatLastActivity(value?: string): string {
+  if (!value) return "最後活動：N/A";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "最後活動：N/A";
+  return `最後活動：${date.toLocaleString([], {
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
+  })}`;
 }
 
 function renderScanTime(next: ManagementSnapshot): void {
@@ -439,7 +622,7 @@ function renderScanTime(next: ManagementSnapshot): void {
     return;
   }
   const date = new Date(next.last_scan_at);
-  elements.scanTime.textContent = `扫描于 ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+  elements.scanTime.textContent = `掃描於 ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
 }
 
 function updateCountdowns(): void {
@@ -452,7 +635,17 @@ function updateCountdownElement(element: HTMLElement): void {
     element.textContent = "--";
     return;
   }
-  element.textContent = formatDuration(Math.max(0, Math.ceil((dueAt - Date.now()) / 1000)));
+  const seconds = Math.max(0, Math.ceil((dueAt - Date.now()) / 1000));
+  element.textContent = element.dataset.countdownStyle === "quota" ? formatQuotaDuration(seconds) : formatDuration(seconds);
+}
+
+function formatQuotaDuration(totalSeconds: number): string {
+  if (totalSeconds <= 0) return "重新確認中…";
+  const minutes = Math.max(1, Math.ceil(totalSeconds / 60));
+  if (minutes < 60) return `${minutes} 分鐘`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 24) return `${hours} 小時`;
+  return `${Math.ceil(hours / 24)} 天`;
 }
 
 function formatDuration(totalSeconds: number): string {
@@ -461,138 +654,152 @@ function formatDuration(totalSeconds: number): string {
   const seconds = totalSeconds % 60;
   if (minutes < 60) return `${minutes} 分 ${String(seconds).padStart(2, "0")} 秒`;
   const hours = Math.floor(minutes / 60);
-  return `${hours} 时 ${String(minutes % 60).padStart(2, "0")} 分`;
+  if (hours < 24) return `${hours} 時 ${String(minutes % 60).padStart(2, "0")} 分`;
+  const days = Math.floor(hours / 24);
+  return `${days} 天 ${String(hours % 24).padStart(2, "0")} 時`;
 }
 
 function classLabel(value: FailureClass): string {
   const labels: Record<FailureClass, string> = {
-    transient: "连接中断",
-    rate_limit: "请求限流",
-    server: "供应商故障",
-    auth_transient: "登录服务暂不可用",
-    auth_limited: "登录异常",
-    empty_response: "模型空回复",
+    transient: "連線中斷",
+    rate_limit: "要求遭限流",
+    server: "服務供應商故障",
+    auth_transient: "登入服務暫時無法使用",
+    auth_limited: "登入異常",
+    empty_response: "模型空白回覆",
     unknown: "未知故障",
-    none: "未分类",
+    none: "未分類",
   };
   return labels[value] ?? "未知故障";
 }
 
 function actionLabel(value?: string): string {
   const labels: Record<string, string> = {
-    dispatching: "准备恢复",
-    goal_resume: "目标恢复",
-    goal_active: "目标运行",
-    conversation_continue: "对话继续",
-    subagent_continue: "子 Agent 恢复",
-    goal_block: "目标停止",
+    dispatching: "準備恢復",
+    goal_resume: "目標恢復",
+    goal_active: "目標執行",
+    conversation_continue: "對話繼續",
+    subagent_continue: "子 Agent 恢復",
+    goal_block: "目標停止",
   };
-  return value ? (labels[value] ?? "正在处理") : "正在处理";
+  return value ? (labels[value] ?? "正在處理") : "正在處理";
 }
 
 function stopReasonLabel(retry: ManagedRetry): string {
   if (retry.stop_reason === "codex_not_running") {
-    return "Codex 已退出，自动重试已停止";
+    return "Codex 已退出，自動重試已停止";
   }
   if (retry.stop_reason === "shared_app_server_disabled") {
-    return "共享后台模式已关闭，Codex 仍使用官方后台";
+    return "Codex自動續跑助手已關閉，Codex 仍使用官方後台";
+  }
+  if (retry.stop_reason === "cli_fallback_failed") {
+    return "背景 CLI 無法啟動；未建立重複 Session";
+  }
+  if (retry.stop_reason === "cli_fallback_timeout") {
+    return "30 分鐘內未收到完成事件，已停止監控且不自動重複 Resume";
   }
   if (retry.stop_reason === "codex_restart_required") {
-    return "通过安全启动 Codex 入口重新打开后接入共享后台";
+    return "透過安全啟動 Codex 入口重新開啟後接入 Codex自動續跑助手";
   }
   if (retry.stop_reason === "codex_home_not_shared") {
-    return "此任务不在当前 Codex 的共享会话目录中";
+    return "此 Task 不在目前 Codex 的本機工作階段目錄中";
   }
   if (retry.stop_reason === "shared_app_server_port_conflict") {
-    return "首选恢复端口不可用，等待安全迁移";
+    return "首選恢復連接埠無法使用，等待安全遷移";
   }
   if (retry.stop_reason === "shared_app_server_port_reserved") {
-    return "后台恢复端口被 Windows 保留";
+    return "背景恢復連接埠被 Windows 保留";
   }
   if (retry.stop_reason === "shared_app_server_environment_conflict") {
-    return "共享后台环境变量已被其他值占用";
+    return "Codex自動續跑助手環境變數已被其他值占用";
   }
   if (retry.stop_reason === "shared_app_server_ownership_unknown") {
-    return "共享后台归属无法确认，需人工清理";
+    return "Codex自動續跑助手歸屬無法確認，需要人工清理";
   }
   if (retry.stop_reason === "shared_app_server_config_invalid") {
-    return "共享后台配置与当前 Codex 不兼容，已自动切回官方后台";
+    return "Codex自動續跑助手設定與目前 Codex 不相容，已自動切回官方後台";
   }
   if (retry.stop_reason === "shared_app_server_migration_deferred") {
-    return "等待 Codex 关闭后完成后台迁移";
+    return "等待 Codex 關閉後完成後台遷移";
   }
   if (retry.stop_reason?.startsWith("controller_") || retry.stop_reason?.startsWith("codex_background_") || retry.stop_reason === "app_server_request_failed") {
-    return "后台恢复通道连续失败，已停止空转";
+    return "背景恢復通道連續失敗，已停止空轉";
   }
   if (retry.stop_reason === "goal_empty_response_limit_block_failed") {
-    return `目标连续空回复达到上限，恢复已停止，但自动设为受阻失败`;
+    return `目標連續空白回覆達到上限，恢復已停止，但自動設為受阻失敗`;
   }
   if (retry.stop_reason === "goal_empty_response_limit") {
-    return `目标连续空回复达到上限，目标恢复已停止`;
+    return `目標連續空白回覆達到上限，目標恢復已停止`;
   }
   if (retry.stop_reason === "consecutive_retry_limit") {
-    return `无进展 ${retry.consecutive_retry}/${retry.max_consecutive_retries ?? retry.consecutive_retry} 达上限`;
+    return `無進展 ${retry.consecutive_retry}/${retry.max_consecutive_retries ?? retry.consecutive_retry} 達到上限`;
   }
   if (retry.stop_reason === "recovery_time_limit") {
-    return "自动恢复运行时间达到 30 分钟上限";
+    return "自動恢復執行時間達到 30 分鐘上限";
   }
-  return `本次恢复 ${retry.recovery_attempt}/${retry.max_recovery_attempts ?? retry.recovery_attempt} 达上限`;
+  return `本次恢復 ${retry.recovery_attempt}/${retry.max_recovery_attempts ?? retry.recovery_attempt} 達到上限`;
 }
 
 function stoppedStateLabel(retry: ManagedRetry): string {
   switch (retry.stop_reason) {
     case "shared_app_server_disabled":
-      return "共享后台已关闭";
+      return "Codex自動續跑助手已關閉";
     case "codex_not_running":
       return "Codex 已退出";
     case "codex_restart_required":
-      return "等待安全启动 Codex";
+      return "等待安全啟動 Codex";
+    case "cli_fallback_failed":
+      return "CLI 備援啟動失敗";
+    case "cli_fallback_timeout":
+      return "CLI 備援已達安全上限";
     case "codex_ipc_goal_control_unsupported":
-      return "官方 IPC 暂不支持目标停止";
+      return "官方 IPC 暫不支援目標停止";
     case "subagent_recovery_event_unavailable":
-      return "子 Agent 恢复事件不可用";
+      return "子 Agent 恢復事件無法使用";
     case "subagent_parent_owner_unavailable":
-      return "父任务所有者不可用";
+      return "父 Task 擁有者無法使用";
     case "subagent_parent_recovery_failed":
-      return "父任务恢复事件失败";
+      return "父 Task 恢復事件失敗";
     case "codex_home_not_shared":
-      return "任务目录未接入";
+      return "Task 目錄未接入";
     case "shared_app_server_port_conflict":
-      return "恢复端口冲突";
+      return "恢復連接埠衝突";
     case "shared_app_server_port_reserved":
-      return "端口被 Windows 保留";
+      return "連接埠被 Windows 保留";
     case "shared_app_server_environment_conflict":
-      return "共享后台环境冲突";
+      return "Codex自動續跑助手環境衝突";
     case "shared_app_server_ownership_unknown":
-      return "共享后台归属未知";
+      return "Codex自動續跑助手歸屬未知";
     case "shared_app_server_migration_deferred":
-      return "等待 Codex 关闭";
+      return "等待 Codex 關閉";
     default:
-      return "达到上限";
+      return "達到上限";
   }
 }
 
 function controllerStateLabel(value: string): string {
   const labels: Record<string, string> = {
-    codex_restart_required: "需要安全启动 Codex",
+    codex_restart_required: "需要安全啟動 Codex",
     official_ipc_ready: "新版 Codex 官方 IPC 已接入",
-    codex_ipc_goal_control_unsupported: "官方 IPC 暂不支持目标停止，恢复已停止",
-    subagent_recovery_event_unavailable: "无法确认子 Agent 的恢复事件",
-    subagent_parent_owner_unavailable: "无法确认父任务所有者",
-    subagent_parent_recovery_failed: "父任务恢复事件提交失败",
-    codex_not_running: "Codex 已退出，自动重试已停止",
-    shared_app_server_disabled: "共享后台模式已关闭，Codex 使用官方后台",
-    codex_home_not_shared: "任务目录未接入共享通道",
-    shared_app_server_port_conflict: "共享端口被占用",
-    shared_app_server_port_reserved: "共享端口被 Windows 保留",
+    codex_ipc_goal_control_unsupported: "官方 IPC 暫不支援目標停止，恢復已停止",
+    subagent_recovery_event_unavailable: "無法確認子 Agent 的恢復事件",
+    subagent_parent_owner_unavailable: "無法確認父 Task 擁有者",
+    subagent_parent_recovery_failed: "父 Task 恢復事件提交失敗",
+    codex_not_running: "Codex 已退出，自動重試已停止",
+    shared_app_server_disabled: "Codex自動續跑助手已關閉，Codex 使用官方後台",
+    codex_home_not_shared: "Task 目錄未接入本機恢復通道",
+    shared_app_server_port_conflict: "本機恢復連接埠被占用",
+    shared_app_server_port_reserved: "本機恢復連接埠被 Windows 保留",
     shared_app_server_environment_conflict: "CODEX_APP_SERVER_WS_URL 已被其他值占用",
-    shared_app_server_ownership_unknown: "共享后台归属无法确认，需人工清理",
-    shared_app_server_migration_deferred: "等待 Codex 关闭后完成后台迁移",
-    shared_app_server_config_invalid: "共享后台配置与当前 Codex 不兼容，已切回官方后台",
-    codex_background_channel_unavailable: "共享通道不可用",
-    codex_background_dispatch_failed: "恢复请求失败",
-    controller_timeout: "恢复请求超时",
-    controller_unavailable: "控制器不可用",
+    shared_app_server_ownership_unknown: "Codex自動續跑助手歸屬無法確認，需要人工清理",
+    shared_app_server_migration_deferred: "等待 Codex 關閉後完成後台遷移",
+    shared_app_server_config_invalid: "Codex自動續跑助手設定與目前 Codex 不相容，已切回官方後台",
+    codex_background_channel_unavailable: "本機恢復通道無法使用",
+    codex_background_dispatch_failed: "恢復要求失敗",
+    controller_timeout: "恢復要求逾時",
+    controller_unavailable: "控制器無法使用",
+    cli_fallback_failed: "背景 CLI 備援啟動失敗",
+    cli_fallback_timeout: "背景 CLI 備援已達 30 分鐘安全上限",
   };
   return labels[value] ?? value;
 }
@@ -602,8 +809,8 @@ function updatePromptState(): void {
   const count = Array.from(value).length;
   elements.promptCount.textContent = String(count);
   let error = "";
-  if (!value.trim()) error = "重试文字不能为空";
-  else if (count > 500) error = "最多 500 个字符";
+  if (!value.trim()) error = "重試文字不能為空白";
+  else if (count > 500) error = "最多 500 個字元";
   elements.promptError.textContent = error;
   elements.savePrompt.disabled = Boolean(error) || value === savedPrompt || busyCount > 0;
   const strategy = selectedDelayStrategy();
@@ -613,24 +820,30 @@ function updatePromptState(): void {
   const recoveryAttempts = Number(elements.maxRecoveryAttempts.value);
   const consecutiveRetries = Number(elements.maxConsecutiveRetries.value);
   const memoryLimit = Number(elements.memoryLimit.value);
+  const resumeInterval = Number(elements.resumeInterval.value);
+  const usageRefresh = Number(elements.usageRefresh.value);
   let settingsError = "";
   if (!Number.isInteger(recoveryAttempts) || recoveryAttempts < 1 || recoveryAttempts > 1000) {
-    settingsError = "本次故障恢复上限应为 1 到 1000";
+    settingsError = "本次故障恢復上限應為 1 到 1000";
   } else if (!Number.isInteger(consecutiveRetries) || consecutiveRetries < 1 || consecutiveRetries > 100) {
-    settingsError = "连续无进展重试上限应为 1 到 100";
+    settingsError = "連續無進展重試上限應為 1 到 100";
   } else if (!Number.isInteger(memoryLimit) || memoryLimit < 128 || memoryLimit > 65536) {
-    settingsError = "内存上限应为 128 到 65536 MB";
+    settingsError = "記憶體上限應為 128 到 65536 MB";
+  } else if (!Number.isInteger(resumeInterval) || resumeInterval < 0 || resumeInterval > 3600) {
+    settingsError = "多 Task Resume 間隔應為 0 到 3600 秒";
+  } else if (!Number.isInteger(usageRefresh) || usageRefresh < 1 || usageRefresh > 1440) {
+    settingsError = "額度更新頻率應為 1 到 1440 分鐘";
   } else if ((strategy !== "fixed" && strategy !== "linear" && strategy !== "exponential")
     || !Number.isInteger(initialDelay) || initialDelay < 1 || initialDelay > 3600
     || !Number.isInteger(maxDelay) || maxDelay < 1 || maxDelay > 86400
     || !Number.isInteger(delayIncrement) || delayIncrement < 1 || delayIncrement > 3600) {
-    settingsError = "等待时间设置超出范围";
+    settingsError = "等待時間設定超出範圍";
   } else if (strategy !== "fixed" && maxDelay < initialDelay) {
-    settingsError = "递增等待时，最大等待不能小于首次等待";
+    settingsError = "遞增等待時，最大等待不能小於首次等待";
   }
   elements.maxDelay.disabled = strategy === "fixed";
   elements.delayIncrement.disabled = strategy !== "linear";
-  elements.initialDelayLabel.textContent = strategy === "fixed" ? "固定间隔（秒）" : "首次等待（秒）";
+  elements.initialDelayLabel.textContent = strategy === "fixed" ? "固定間隔（秒）" : "首次等待（秒）";
   elements.settingsError.textContent = settingsError;
   updateDelayPreview(strategy, initialDelay, maxDelay, delayIncrement, consecutiveRetries);
   elements.saveSettings.disabled = Boolean(error) || Boolean(settingsError)
@@ -643,6 +856,9 @@ function currentSettings(): string {
     max_recovery_attempts: Number(elements.maxRecoveryAttempts.value),
     max_consecutive_retries: Number(elements.maxConsecutiveRetries.value),
     memory_limit_mb: Number(elements.memoryLimit.value),
+    resume_interval_seconds: Number(elements.resumeInterval.value),
+    usage_refresh_minutes: Number(elements.usageRefresh.value),
+    cli_resume_fallback_enabled: elements.cliFallbackToggle.checked,
     initial_delay_seconds: Number(elements.initialDelay.value),
     max_delay_seconds: Number(elements.maxDelay.value),
     delay_increment_seconds: Number(elements.delayIncrement.value),
@@ -657,6 +873,9 @@ function serializedSettings(value: ManagementSnapshot): string {
     max_recovery_attempts: value.max_recovery_attempts,
     max_consecutive_retries: value.max_consecutive_retries,
     memory_limit_mb: value.memory_limit_mb,
+    resume_interval_seconds: value.resume_interval_seconds,
+    usage_refresh_minutes: value.usage_refresh_minutes,
+    cli_resume_fallback_enabled: value.cli_resume_fallback_enabled,
     initial_delay_seconds: value.initial_delay_seconds,
     max_delay_seconds: value.max_delay_seconds,
     delay_increment_seconds: value.delay_increment_seconds,
@@ -698,8 +917,8 @@ function updateDelayPreview(
 
 function formatPreviewDelay(seconds: number): string {
   if (seconds < 60) return `${seconds} 秒`;
-  if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
-  if (seconds % 60 === 0) return `${seconds / 60} 分钟`;
+  if (seconds % 3600 === 0) return `${seconds / 3600} 小時`;
+  if (seconds % 60 === 0) return `${seconds / 60} 分鐘`;
   return `${seconds} 秒`;
 }
 
@@ -710,15 +929,20 @@ function setBusy(active: boolean): void {
   elements.refreshButton.classList.toggle("is-spinning", busy);
   elements.pauseToggle.disabled = busy || !snapshot;
   elements.sharedAppServerToggle.disabled = busy || !snapshot;
+  elements.cliFallbackToggle.disabled = busy || !snapshot;
   document.querySelectorAll<HTMLButtonElement>(".queue-action").forEach((button) => {
     button.disabled = busy;
   });
+  document.querySelectorAll<HTMLInputElement>(".task-selector").forEach((input) => {
+    input.disabled = busy || !snapshot?.retries.some((retry) => retry.thread_id === input.closest<HTMLElement>("[data-thread-id]")?.dataset.threadId && canSelectForResume(retry));
+  });
+  if (snapshot) updateTaskSelection(snapshot);
   updatePromptState();
 }
 
 async function callTool(name: string, args: Record<string, unknown> = {}, quiet = false): Promise<void> {
   if (!app) {
-    showNotice("管理面板尚未连接", true);
+    showNotice("管理面板尚未連線", true);
     return;
   }
   if (quiet) {
@@ -731,7 +955,7 @@ async function callTool(name: string, args: Record<string, unknown> = {}, quiet 
     const result = (await app.callServerTool({ name, arguments: args })) as ToolResult;
     const next = extractSnapshot(result);
     if (next) render(next);
-    else if (result.isError) throw new Error(result.content?.find((item) => item.text)?.text ?? "操作失败");
+    else if (result.isError) throw new Error(result.content?.find((item) => item.text)?.text ?? "操作失敗");
   } catch (error) {
     if (name === "set_shared_app_server_enabled") {
       // A failed health check may still have persisted the user's preference.
@@ -743,7 +967,7 @@ async function callTool(name: string, args: Record<string, unknown> = {}, quiet 
     if (name === "set_shared_app_server_enabled" && snapshot) {
       elements.sharedAppServerToggle.checked = snapshot.shared_app_server_requested ?? snapshot.shared_app_server_enabled;
     }
-    if (!quiet) showNotice(error instanceof Error ? error.message : "操作失败", true);
+    if (!quiet) showNotice(error instanceof Error ? error.message : "操作失敗", true);
   } finally {
     if (quiet) {
       statusPollInFlight = false;
@@ -758,6 +982,30 @@ async function runThreadAction(name: "retry_now" | "cancel_retry" | "restart_ret
   window.setTimeout(() => void callTool("get_auto_retry_status"), 1200);
 }
 
+async function resumeSelectedTasks(): Promise<void> {
+  if (!app || !snapshot) return;
+  const targets = snapshot.retries.filter((retry) => selectedTaskIds.has(retry.thread_id) && canSelectForResume(retry));
+  if (targets.length === 0) return;
+  setBusy(true);
+  let completed = 0;
+  try {
+    for (const retry of targets) {
+      const name = retry.can_restart ? "restart_retry" : "retry_now";
+      const result = (await app.callServerTool({ name, arguments: { thread_id: retry.thread_id } })) as ToolResult;
+      if (result.isError) throw new Error(result.content?.find((item) => item.text)?.text ?? `${retry.label} 操作失敗`);
+      completed += 1;
+    }
+    selectedTaskIds.clear();
+    const latest = extractSnapshot((await app.callServerTool({ name: "get_auto_retry_status", arguments: {} })) as ToolResult);
+    if (latest) render(latest);
+    showNotice(`已排入 ${completed} 個 Task；系統會依 Resume 間隔依序啟動`, false);
+  } catch (error) {
+    showNotice(`${completed} 個已排入；${error instanceof Error ? error.message : "其餘操作失敗"}`, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
 function showNotice(message: string, isError: boolean): void {
   window.clearTimeout(noticeTimer);
   elements.notice.textContent = message;
@@ -769,23 +1017,36 @@ function showNotice(message: string, isError: boolean): void {
 }
 
 elements.refreshButton.addEventListener("click", () => void callTool("get_auto_retry_status"));
+elements.selectAllTasks.addEventListener("change", () => {
+  if (!snapshot) return;
+  for (const retry of snapshot.retries.filter(canSelectForResume)) {
+    if (elements.selectAllTasks.checked) selectedTaskIds.add(retry.thread_id);
+    else selectedTaskIds.delete(retry.thread_id);
+  }
+  renderQueue(snapshot);
+});
+elements.resumeSelected.addEventListener("click", () => void resumeSelectedTasks());
 elements.pauseToggle.addEventListener("change", () => void callTool("set_auto_retry_paused", { paused: !elements.pauseToggle.checked }));
+elements.monitoringToggle.addEventListener("change", () => void callTool("set_monitoring_paused", { paused: !elements.monitoringToggle.checked }));
   elements.sharedAppServerToggle.addEventListener("change", () => {
   const enabled = elements.sharedAppServerToggle.checked;
   elements.sharedAppServerDescription.textContent = enabled
-    ? `正在使用插件拥有且已通过健康检查的后台（端口 ${snapshot?.shared_app_server_port ?? ""}）`
-    : "默认关闭，不影响 Codex 官方后台";
+    ? `正在使用已通過健康檢查的 Codex自動續跑助手（連接埠 ${snapshot?.shared_app_server_port ?? ""}）`
+    : "預設關閉；關閉時仍可查看額度";
   void callTool("set_shared_app_server_enabled", { enabled });
 });
 elements.retryPrompt.addEventListener("input", updatePromptState);
 elements.maxRecoveryAttempts.addEventListener("input", updatePromptState);
 elements.maxConsecutiveRetries.addEventListener("input", updatePromptState);
 elements.memoryLimit.addEventListener("input", updatePromptState);
+elements.resumeInterval.addEventListener("input", updatePromptState);
+elements.usageRefresh.addEventListener("input", updatePromptState);
 for (const option of elements.delayStrategies) option.addEventListener("change", updatePromptState);
 elements.initialDelay.addEventListener("input", updatePromptState);
 elements.maxDelay.addEventListener("input", updatePromptState);
 elements.delayIncrement.addEventListener("input", updatePromptState);
 elements.notificationsToggle.addEventListener("change", updatePromptState);
+elements.cliFallbackToggle.addEventListener("change", updatePromptState);
 elements.savePrompt.addEventListener("click", () => void callTool("set_retry_prompt", { prompt: elements.retryPrompt.value }));
 elements.saveSettings.addEventListener("click", () => void callTool("set_retry_settings", JSON.parse(currentSettings()) as Record<string, unknown>));
 
@@ -798,8 +1059,8 @@ window.setInterval(() => {
 if (new URLSearchParams(window.location.search).has("preview")) {
   render(previewSnapshot());
 } else {
-  app = new App({ name: "Codex Auto Retry", version: "0.7.11" });
-  app.onerror = (error) => showNotice(error instanceof Error ? error.message : "连接失败", true);
+  app = new App({ name: "CodexWorkResumer", version: "1.3.1" });
+  app.onerror = (error) => showNotice(error instanceof Error ? error.message : "連線失敗", true);
   app.onhostcontextchanged = handleHostContext;
   app.ontoolresult = (result) => {
     const next = extractSnapshot(result as ToolResult);
@@ -811,20 +1072,23 @@ if (new URLSearchParams(window.location.search).has("preview")) {
       if (context) handleHostContext(context);
       return callTool("get_auto_retry_status");
     })
-    .catch((error) => showNotice(error instanceof Error ? error.message : "连接失败", true));
+    .catch((error) => showNotice(error instanceof Error ? error.message : "連線失敗", true));
 }
 
 function previewSnapshot(): ManagementSnapshot {
   const now = Date.now();
   return {
-    version: "0.7.11",
+    version: "1.3.1",
+    build: 15,
     running: true,
     heartbeat_stale: false,
     paused: false,
+    monitoring_paused: false,
     shared_app_server_enabled: false,
+    cli_resume_fallback_enabled: false,
     startup_approved: "enabled",
     shared_app_server_port: 49621,
-    retry_prompt: "继续",
+    retry_prompt: "繼續",
     max_recovery_attempts: 15,
     max_consecutive_retries: 5,
     memory_limit_mb: 1024,
@@ -836,6 +1100,8 @@ function previewSnapshot(): ManagementSnapshot {
     max_delay_seconds: 300,
     delay_increment_seconds: 2,
     delay_strategy: "exponential",
+    resume_interval_seconds: 30,
+    usage_refresh_minutes: 3,
     controller_state: "ready",
     show_notifications: true,
     now: new Date(now).toISOString(),
@@ -843,11 +1109,34 @@ function previewSnapshot(): ManagementSnapshot {
     pending_retries: 2,
     active_retries: 1,
     stopped_retries: 1,
+    rate_limited_retries: 1,
     watched_roots: 3,
+    codex_usage: {
+      adapter: "codex",
+      available: true,
+      source: "account/rateLimits/read",
+      fetched_at: new Date(now - 15_000).toISOString(),
+      observed_at: new Date(now - 15_000).toISOString(),
+      five_hour: {
+        used_percent: 72,
+        remaining_percent: 28,
+        window_duration_mins: 300,
+        resets_at: Math.floor((now + 48 * 60_000) / 1000),
+      },
+      weekly: {
+        used_percent: 44,
+        remaining_percent: 56,
+        window_duration_mins: 10080,
+        resets_at: Math.floor((now + 345_600_000) / 1000),
+      },
+    },
     retries: [
       {
         thread_id: "019f9d5d-9c82-75b1-b7c0-20a658af0423",
-        label: "任务 019f9d5d",
+        label: "CodexWorkResumer · 019f9d5d",
+        project_path: "C:\\Projects\\CodexWorkResumer",
+        task_type: "Codex",
+        last_activity_at: new Date(now - 45_000).toISOString(),
         state: "running",
         class: "server",
         seconds_remaining: 0,
@@ -862,7 +1151,10 @@ function previewSnapshot(): ManagementSnapshot {
       },
       {
         thread_id: "019f9d5d-9c82-75b1-b7c0-20a658af0424",
-        label: "任务 019f9d5e",
+        label: "Research · 019f9d5e",
+        project_path: "C:\\Projects\\Research",
+        task_type: "Codex",
+        last_activity_at: new Date(now - 120_000).toISOString(),
         state: "pending",
         class: "rate_limit",
         due_at: new Date(now + 42_000).toISOString(),
@@ -877,7 +1169,10 @@ function previewSnapshot(): ManagementSnapshot {
       },
       {
         thread_id: "019f9d5d-9c82-75b1-b7c0-20a658af0425",
-        label: "任务 019f9d5f",
+        label: "Website · 019f9d5f",
+        project_path: "C:\\Projects\\Website",
+        task_type: "Codex",
+        last_activity_at: new Date(now - 300_000).toISOString(),
         state: "pending",
         class: "transient",
         due_at: new Date(now + 126_000).toISOString(),
@@ -892,7 +1187,10 @@ function previewSnapshot(): ManagementSnapshot {
       },
       {
         thread_id: "019f9d5d-9c82-75b1-b7c0-20a658af0426",
-        label: "任务 019f9d60",
+        label: "Mobile · 019f9d60",
+        project_path: "C:\\Projects\\Mobile",
+        task_type: "Codex",
+        last_activity_at: new Date(now - 900_000).toISOString(),
         state: "stopped",
         class: "server",
         seconds_remaining: 0,

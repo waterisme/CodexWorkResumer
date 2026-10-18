@@ -29,6 +29,9 @@ type appResumeRunner struct {
 	controller    recoveryController
 	configPath    string
 	defaultPrompt string
+	readUsage     func(context.Context) (UsageSnapshot, error)
+	cliFallback   func(RetryJob, ResumeSettings, string) (DispatchResult, error)
+	now           func() time.Time
 }
 
 type controllerStateRunner interface {
@@ -78,10 +81,20 @@ func (e *controllerReasonError) Error() string {
 }
 
 func newAppResumeRunner(config Config, dataDir string, logger *safeLogger) *appResumeRunner {
+	endpoint := ""
+	if config.SharedAppServerEnabled {
+		endpoint = adapterEndpoint(config.SharedAppServerPort)
+	}
+	adapter := NewCodexAdapterForConfig(endpoint, config)
 	return &appResumeRunner{
 		controller:    newSharedAppServerController(config, dataDir, logger),
 		configPath:    filepath.Join(dataDir, "config.json"),
 		defaultPrompt: config.RetryPrompt,
+		readUsage:     adapter.ReadUsage,
+		cliFallback: func(job RetryJob, settings ResumeSettings, prompt string) (DispatchResult, error) {
+			return dispatchCLIResumeFallback(job, settings, prompt, logger)
+		},
+		now: func() time.Time { return time.Now().UTC() },
 	}
 }
 
@@ -171,6 +184,11 @@ func (r *appResumeRunner) Resume(ctx context.Context, job RetryJob) (DispatchRes
 		}
 		return validateDispatchResultForJob(job.Kind, result)
 	}
+	if job.Class == classRateLimit {
+		if result, wait := r.quotaGate(ctx, job); wait {
+			return result, nil
+		}
+	}
 	settings, err := loadLatestResumeSettings(job.RolloutPath)
 	if err != nil {
 		return DispatchResult{}, err
@@ -198,9 +216,113 @@ func (r *appResumeRunner) Resume(ctx context.Context, job RetryJob) (DispatchRes
 		return DispatchResult{}, errControllerTimeout
 	}
 	if err != nil {
+		retryResult := retryLaterResult(controllerFailureReason(result, err), result.ParentNotified)
+		if fallback, used := r.tryCLIFallback(job, settings, retryPrompt, retryResult); used {
+			return fallback, nil
+		}
 		return DispatchResult{}, err
 	}
-	return validateDispatchResultForJob(job.Kind, result)
+	validated, err := validateDispatchResultForJob(job.Kind, result)
+	if err != nil {
+		return DispatchResult{}, err
+	}
+	if fallback, used := r.tryCLIFallback(job, settings, retryPrompt, validated); used {
+		return fallback, nil
+	}
+	return validated, nil
+}
+
+func (r *appResumeRunner) tryCLIFallback(job RetryJob, settings ResumeSettings, prompt string, primary DispatchResult) (DispatchResult, bool) {
+	if r.cliFallback == nil || !r.cliFallbackEnabled() || !shouldUseCLIResumeFallback(job, primary) {
+		return DispatchResult{}, false
+	}
+	fallback, err := r.cliFallback(job, settings, prompt)
+	if err != nil {
+		return retryLaterResult("cli_fallback_failed", primary.ParentNotified), true
+	}
+	validated, err := validateDispatchResultForJob(job.Kind, fallback)
+	if err != nil {
+		return retryLaterResult("cli_fallback_failed", primary.ParentNotified), true
+	}
+	return validated, true
+}
+
+func (r *appResumeRunner) cliFallbackEnabled() bool {
+	if r == nil || r.configPath == "" {
+		return false
+	}
+	config, err := loadOrCreateConfig(r.configPath)
+	return err == nil && config.CLIResumeFallbackEnabled
+}
+
+func shouldUseCLIResumeFallback(job RetryJob, result DispatchResult) bool {
+	if job.Kind != jobRecovery || job.GoalLimitRestart || job.Class == classEmptyResponse || result.Outcome != outcomeRetryLater {
+		return false
+	}
+	switch result.Reason {
+	case "shared_app_server_disabled", "codex_restart_required", "codex_not_running", "codex_app_not_ready",
+		"codex_home_not_shared", "codex_thread_owner_unavailable", "codex_background_channel_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *appResumeRunner) quotaGate(ctx context.Context, job RetryJob) (DispatchResult, bool) {
+	now := time.Now().UTC()
+	if r.now != nil {
+		now = r.now().UTC()
+	}
+	recheck := defaultUsageRefresh
+	if r.configPath != "" {
+		if config, err := loadOrCreateConfig(r.configPath); err == nil && config.UsageRefreshMinutes > 0 {
+			recheck = time.Duration(config.UsageRefreshMinutes) * time.Minute
+		}
+	}
+	unavailable := func() (DispatchResult, bool) {
+		return DispatchResult{
+			Outcome: outcomeRetryLater,
+			Reason:  "quota_status_unavailable",
+			RetryAt: now.Add(recheck),
+		}, true
+	}
+	if r.readUsage == nil {
+		return unavailable()
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	snapshot, err := r.readUsage(readCtx)
+	cancel()
+	if err != nil || !snapshot.Available || snapshot.Source != "account/rateLimits/read" ||
+		snapshot.FiveHour == nil || snapshot.Weekly == nil {
+		return unavailable()
+	}
+	retryAt, wait := quotaWaitUntil(snapshot, now, recheck)
+	if wait {
+		return DispatchResult{Outcome: outcomeRetryLater, Reason: "quota_limited", RetryAt: retryAt}, true
+	}
+	if job.WaitReason == "quota_limited" {
+		// A previous, persisted reset deadline has elapsed and the fresh read
+		// no longer reports a limit. The provider may now be tried once.
+		return DispatchResult{}, false
+	}
+	// A provider can report usage_limit_exceeded while the aggregate 5H/7D
+	// percentages still show room (for example another bucket or delayed
+	// accounting). Do not treat that contradiction as permission to retry
+	// every few seconds. Recheck at the next published reset boundary first.
+	retryAt = time.Time{}
+	for _, window := range []*UsageWindow{snapshot.FiveHour, snapshot.Weekly} {
+		if window == nil {
+			continue
+		}
+		reset := time.Unix(window.ResetsAt, 0).UTC()
+		if reset.After(now) && (retryAt.IsZero() || reset.Add(quotaResetGrace).Before(retryAt)) {
+			retryAt = reset.Add(quotaResetGrace)
+		}
+	}
+	if retryAt.IsZero() {
+		retryAt = now.Add(recheck)
+	}
+	return DispatchResult{Outcome: outcomeRetryLater, Reason: "quota_limited", RetryAt: retryAt}, true
 }
 
 func (r *appResumeRunner) retryPrompt() (string, error) {
@@ -235,6 +357,9 @@ func validateDispatchResult(result DispatchResult) (DispatchResult, error) {
 	}
 	if result.Reason != "" && safeReasonCode(result.Reason) == "" {
 		return DispatchResult{}, fmt.Errorf("%w: reason", errControllerInvalidResult)
+	}
+	if !result.RetryAt.IsZero() && result.Outcome != outcomeRetryLater {
+		return DispatchResult{}, fmt.Errorf("%w: retry time", errControllerInvalidResult)
 	}
 	return result, nil
 }

@@ -18,7 +18,7 @@ const (
 
 func newRuntimeState() RuntimeState {
 	return RuntimeState{
-		Version:         5,
+		Version:         6,
 		Files:           make(map[string]FileCursor),
 		Threads:         make(map[string]ThreadState),
 		ProcessedEvents: make(map[string]time.Time),
@@ -50,7 +50,7 @@ func loadState(path string) (RuntimeState, error) {
 		state.ProcessedEvents = make(map[string]time.Time)
 	}
 	migrateCodex153ThreadIDs(&state)
-	state.Version = 5
+	state.Version = 6
 	for id, thread := range state.Threads {
 		if thread.RecoveryAttempts < 1 && thread.LegacyFailures > 0 {
 			thread.RecoveryAttempts = thread.LegacyFailures
@@ -118,6 +118,9 @@ func (s *RuntimeState) prune(now time.Time) {
 	}
 	threadCutoff := now.Add(-30 * 24 * time.Hour)
 	for id, thread := range s.Threads {
+		if id == s.QuotaSchedulerOwnerID {
+			continue
+		}
 		lastActivity := thread.LastFailureAt
 		if thread.GoalUpdatedAt.After(lastActivity) {
 			lastActivity = thread.GoalUpdatedAt
@@ -140,7 +143,7 @@ func (s *RuntimeState) prune(now time.Time) {
 	}
 	trimProcessedEvents(s.ProcessedEvents, maxProcessedEventEntries)
 	trimFileCursors(s.Files, maxFileCursorEntries)
-	trimInactiveThreads(s.Threads, maxThreadEntries, now)
+	trimInactiveThreads(s.Threads, s.QuotaSchedulerOwnerID, maxThreadEntries, now)
 }
 
 func trimProcessedEvents(events map[string]time.Time, limit int) {
@@ -189,7 +192,7 @@ func trimFileCursors(files map[string]FileCursor, limit int) {
 	}
 }
 
-func trimInactiveThreads(threads map[string]ThreadState, limit int, now time.Time) {
+func trimInactiveThreads(threads map[string]ThreadState, ownerID string, limit int, now time.Time) {
 	if len(threads) <= limit {
 		return
 	}
@@ -199,6 +202,9 @@ func trimInactiveThreads(threads map[string]ThreadState, limit int, now time.Tim
 	}
 	entries := make([]entry, 0, len(threads))
 	for id, thread := range threads {
+		if id == ownerID {
+			continue
+		}
 		// Never discard a retry that can still run or a recent stopped entry.
 		if thread.Pending != nil || thread.Awaiting != nil {
 			continue
@@ -245,12 +251,20 @@ func trimInactiveThreads(threads map[string]ThreadState, limit int, now time.Tim
 }
 
 func writeRuntimeStateAtomic(path string, state RuntimeState) error {
-	data, err := json.Marshal(state)
+	data, err := marshalRuntimeState(state)
 	if err != nil {
 		return err
 	}
-	if len(data) > maxRuntimeStateBytes {
-		return fmt.Errorf("runtime state exceeds %d bytes", maxRuntimeStateBytes)
+	return writeBytesAtomic(path, data)
+}
+
+func marshalRuntimeState(state RuntimeState) ([]byte, error) {
+	data, err := json.Marshal(state)
+	if err != nil {
+		return nil, err
 	}
-	return writeJSONAtomic(path, state)
+	if len(data) > maxRuntimeStateBytes {
+		return nil, fmt.Errorf("runtime state exceeds %d bytes", maxRuntimeStateBytes)
+	}
+	return append(data, '\n'), nil
 }

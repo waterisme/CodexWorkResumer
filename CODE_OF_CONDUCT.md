@@ -11,4 +11,4 @@ in [SECURITY.md](SECURITY.md), not a public issue.
 
 Project maintainers may edit, close, or remove contributions that violate this
 standard. For a conduct concern, contact the maintainer through the public
-GitHub profile at <https://github.com/sybxxx> with the repository and context.
+GitHub profile at <https://github.com/waterisme> with the repository and context.

@@ -1,15 +1,17 @@
-# Codex Auto Retry
+# CodexWorkResumer
 
-[![CI](https://github.com/sybxxx/codex-auto-retry/actions/workflows/ci.yml/badge.svg)](https://github.com/sybxxx/codex-auto-retry/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/sybxxx/codex-auto-retry?label=latest%20release)](https://github.com/sybxxx/codex-auto-retry/releases/latest)
+CodexWorkResumer is a Windows quota monitor and same-task recovery tool based on [sybxxx/codex-auto-retry](https://github.com/sybxxx/codex-auto-retry). The upstream Git relationship is retained so fixes can continue to be reviewed and merged.
+
+Current source build: **v1.3.1 (Build 15)**. `VERSION.json` is the release source of truth, Build numbers only increase, and every deliverable Build must have a matching entry in `CHANGELOG.md`. The installed program does not change until it is separately upgraded and checked.
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-blue.svg)](#)
 
-[English] | [中文说明](README_zh.md)
+[English] | [繁體中文](README_zh-TW.md)
 
 Codex Auto Retry is an open-source reliability and automatic recovery tool for Codex on Windows. It monitors Codex task lifecycle events and safely resumes the exact interrupted task after recoverable provider, network, rate-limit, timeout, or empty-response failures while preserving working context, permissions, and runtime settings.
 
-It runs as a local Windows watchdog service and does not require a per-task prompt. The watchdog provides a notification-area tray controller and an embedded Codex management panel (via MCP), while recovery remains independent of either interface being open. The latest Windows x64 release is available from the [GitHub Releases](https://github.com/sybxxx/codex-auto-retry/releases/latest) page.
+It runs as a local Windows watchdog service and does not require a per-task prompt. The watchdog provides a notification-area tray controller and an embedded Codex management panel (via MCP), while recovery remains independent of either interface being open. The linked upstream project is a different release line; use a CodexWorkResumer ZIP built from this repository when testing this version.
 
 For contribution boundaries and vulnerability disclosure, see [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
 
@@ -51,20 +53,34 @@ Long-running Codex work can be interrupted after tools have already executed or 
 ### Key Capabilities
 
 - **Exact-task recovery**: Resumes the original Codex thread and keeps its working directory, model/provider, permissions, and reasoning settings.
+- **Quota watchlist and order**: A running task can be checked for later quota recovery without resuming immediately. Dragging the list sets the order for the next eligible quota resumes; manual Resume uses highlighted rows. Before any watchlist is saved, the legacy all-task quota recovery remains active. Transient-failure rescue is unchanged.
+- **Two quota scheduling modes, one scheduler**: Staggered starts are the default (30-second cross-task start gap and a default observed-running limit of two). Sequential completion automatically hands off after a positively completed turn and a later healthy scan still finds no new turn or pending recovery; quota-paused, active, incomplete-goal, and unknown states remain held. This is an observable scheduling handoff, not a claim that the user's broader work is semantically complete. The running limit is best effort for observable work, not a global Codex limit. Existing transient-failure recovery remains separate.
 - **Bounded operation**: Separates recovery and no-progress limits, applies a time circuit breaker, and stops with an explicit reason when a local channel is unavailable.
 - **Current Desktop compatibility**: Supports current rollout filenames and the official Windows IPC owner route (`\\.\pipe\codex-ipc`), with the plugin-owned WebSocket as an optional verified path.
 - **Fail-open safety**: Shared backend mode is opt-in; normal Codex startup uses its official backend when the optional recovery path is unavailable.
 - **Privacy-conscious state**: Retry decisions retain lifecycle metadata only; conversation text, tool contents, credentials, and response bodies are not stored for recovery.
+- **Fresh quota data**: Reads 5H and Weekly limits through `account/rateLimits/read`; if that live query fails, only a local rollout snapshot observed within the last 10 minutes is accepted. Missing or stale data is shown as `N/A`.
+- **Optional CLI fallback**: Disabled by default. When explicitly enabled, ordinary recoverable failures may resume the same session in a background Codex CLI only after the primary Desktop route is known to be unavailable.
+- **Tray controls and saved state**: Single- or double-clicking the notification-area icon opens the main window; right-clicking opens the control menu. At process start, the saved Codex Auto-Resume Assistant choice is actively reconciled to enabled or disabled instead of restoring only the checkbox appearance.
+- **Mini Monitor separation**: The former embedded window and settings page have been removed from this program. A standalone Mini Monitor is a separate development task; the main window retains its quota display.
+- **Four-section main window**: The existing WinForms interface shows monitoring and controls first, followed by sessions and queue order, scheduling mode and parameters, and notifications and history. The existing settings and diagnostics remain available.
+- **Session list usability**: List refresh preserves the user's scroll position; drag-and-drop shows where a row will be inserted; changing a watchlist checkbox avoids flashing raw status codes. These Build 14 interface fixes require validation in the installed Windows app after upgrade.
+- **Clear retry outcomes**: The task list distinguishes a stopped retry with quota watching still selected from a verified successful same-task resume turn. A successful turn does not certify completion of the user's broader project.
+- **Current quota warning**: The orange rate-limit status is tied to active quota-wait entries, not merely historical or stopped tasks. A positive displayed quota percentage does not by itself override a provider's explicit rate-limit rejection.
+- **Lower idle overhead**: The one-second countdown remains smooth, while large recovery state is reread only when it changes or after five seconds. Unchanged heartbeats are written every ten seconds; a healthy shared backend is probed every thirty seconds.
+- **Work support boundary**: ChatGPT Work task discovery and same-task Resume are not available in the standalone Windows tool. The Work adapter deliberately advertises no task or Resume capability until a verifiable integration passes the safety checks in [the Work feasibility note](docs/work-resume-feasibility.md).
 
 ---
 
 ## Quick Start
 
-1. **Download**: Grab the latest Windows x64 ZIP from [Releases](https://github.com/sybxxx/codex-auto-retry/releases/latest).
+1. **Get this build**: Use the Windows x64 ZIP built from this CodexWorkResumer checkout; an upstream `sybxxx/codex-auto-retry` ZIP does not contain these fork changes.
 2. **Extract**: Extract it to a standard local folder (do not run directly from inside the archive preview).
-3. **Install**: Fully close Codex, then double-click `安装.cmd`. The installer verifies the package and starts the watchdog service.
-4. **Verify**: Open Codex and create a new task. The watchdog will automatically detect active tasks. You can also say `打开 Codex Auto Retry 管理面板` to open the embedded control panel.
-5. See [Windows installation notes](release/windows/README-安装说明.txt) for route verification, shared backend details, and safe-launch behavior.
+3. **Install**: Double-click `安裝.cmd`. Codex may remain open when it is using the official backend; only an actively connected Auto-Resume Assistant channel must be closed for a safe upgrade.
+4. **Verify**: Open Codex and create a new task. The watchdog will automatically detect active tasks. You can also say `開啟 CodexWorkResumer 管理面板` to open the embedded control panel.
+5. See [Windows installation notes](release/windows/README-安裝說明.txt) for route verification, recovery-route details, and safe-launch behavior.
+
+For a Store/MSIX Codex executable that denies direct process creation, the safe launcher may fall back to the Windows packaged-app activation entry. This starts Codex in its official-backend mode; it does not claim that the optional shared recovery channel is connected, and it does not forcibly terminate an existing Codex process.
 
 ---
 
@@ -72,10 +88,11 @@ Long-running Codex work can be interrupted after tools have already executed or 
 
 ### Exact-Task & Silent Continuation
 
-- **In-Process Resumption**: Rejoins the exact failed task through the Codex App process that is already running. Codex Desktop and the watchdog are two clients of one local shared app-server, so recovery does not open a task link, focus Codex, change the task currently on screen, or create a hidden `codex exec resume` task.
+- **Primary In-Process Resumption**: Rejoins the exact failed task through official IPC or the verified local app-server route without opening a task link, focusing Codex, or changing the task currently on screen.
+- **Opt-In Headless Fallback**: If the primary route is confirmed unavailable and the user explicitly enables it, a background `codex exec resume` process continues the same session. This does not create a replacement session and does not return the result to the original Codex window; the UI labels this route separately.
 - **Thread Settings Integrity**: The official IPC recovery request preserves the current collaboration-mode model and reasoning settings (required by modern Codex Desktop). It restores the failed task with its latest working directory, workspace roots, model, provider, service tier, reasoning settings, personality, approval routing, and effective permission profile instead of applying generic App defaults.
 - **Clean Dialogue**: In a normal conversation, it starts an empty-input continuation in that same task. The original request and completed tool results stay in context, while no new user-message bubble is added and the composer draft is untouched.
-- **Fallback Compatibility**: Uses the configured fallback retry text (default: `继续` / `Continue`) only as a narrow compatibility fallback when Codex explicitly rejects empty-input turns. It never rolls back and resends the failed turn, preventing duplicate tool execution.
+- **Fallback Compatibility**: Uses the configured fallback retry text (default: `繼續` / `Continue`) only as a narrow compatibility fallback when Codex explicitly rejects empty-input turns. It never rolls back and resends the failed turn, preventing duplicate tool execution.
 - **Rollout Schema Support**: Supports current Codex rollout names in both `thread-id.jsonl` and `thread-id_turn-id.jsonl` forms. The persistent thread ID is kept as the queue key; older turn-keyed state is migrated and duplicate entries for the same task are merged on startup.
 - **Concurrency**: Keeps separate retry state for every task and can dispatch up to four due tasks independently by default. If a failed task is already running, its retry remains queued and will re-check later instead of canceling.
 
@@ -97,11 +114,11 @@ Long-running Codex work can be interrupted after tools have already executed or 
 
 To prevent runaway retry loops and excessive resource consumption, two independent safety limits are enforced:
 
-1. **`本次故障恢复` (`Recoveries This Outage`)**: Bounds all automatic recovery attempts during a single persistent outage (default: 15, configurable from 1 to 1000).
-2. **`连续无进展` (`Consecutive No Progress`)**: Bounds consecutive retries that produce neither a visible assistant reply nor a completed tool result (default: 5, configurable from 1 to 100).
+1. **`本次故障恢復` (`Recoveries This Outage`)**: Bounds all automatic recovery attempts during a single persistent outage (default: 15, configurable from 1 to 1000).
+2. **`連續無進展` (`Consecutive No Progress`)**: Bounds consecutive retries that produce neither a visible assistant reply nor a completed tool result (default: 5, configurable from 1 to 100).
 
 - **Reset Rules**: A successful completion or a new user turn clears both counters; visible progress clears only the consecutive no-progress count.
-- **Exhaustion Handling**: When an active goal reaches either limit through repeated empty replies, the watchdog retains the exhausted entry, marks that goal as `blocked`, and notifies: `目标连续空回复达到上限，目标恢复已停止` (*Goal consecutive empty-reply limit reached, goal recovery stopped*).
+- **Exhaustion Handling**: When an active goal reaches either limit through repeated empty replies, the watchdog retains the exhausted entry, marks that goal as `blocked`, and notifies: `目標連續空白回覆達到上限，目標恢復已停止` (*Goal consecutive empty-reply limit reached, goal recovery stopped*).
 - **Backoff Strategies**: Supports fixed, linear, or doubling (exponential) delays capped at a configurable maximum. Linear waits add a configurable number of seconds each time. Increasing waits follow the consecutive no-progress count, so visible progress resets the delay sequence.
 - **Turn Correlation**: Correlates the new `task_started` turn ID with its matching `task_complete`. An unrelated successful turn cannot falsely mark a retry as recovered.
 
@@ -136,7 +153,7 @@ The watchdog runs as a single lightweight background process with a notification
 
 - **Hover Tooltip**: Displays the current status (running, paused, waiting, active, stopped) and live countdown for the nearest pending retry.
 - **Explorer Restart Recovery**: If Windows Explorer restarts, the watchdog automatically re-registers the tray icon and restores current state.
-- **Double-Click**: Opens the graphical settings window.
+- **Click**: Opens the graphical settings window.
 - **Right-Click Context Menu**: Allows quick pausing/resuming of dispatch, opening settings, or exiting the watchdog.
 
 The settings window allows configuring:
@@ -144,20 +161,14 @@ The settings window allows configuring:
 - Delay curves (fixed, linear increment, or doubling backoff, with custom initial and max caps);
 - Fallback retry text (up to 500 characters);
 - Watchdog notification preferences;
-- One-click Chinese/English localization toggle.
+- One-click Traditional Chinese/English localization toggle.
 
-<p align="center">
-  <img src="assets/settings_en.png" alt="Codex Auto Retry Settings Window (English)" width="520" />
-</p>
+Screenshots are being refreshed for this fork; older screenshots were removed from the publication set because they showed outdated UI and local environment details.
 
 ### Embedded Management Panel (MCP)
 
 Users can open the management panel directly inside Codex by asking:
-> `打开 Codex Auto Retry 管理面板` *(Open Codex Auto Retry Management Panel)*
-
-<p align="center">
-  <img src="assets/panel.png" alt="Codex Embedded Management Panel (MCP)" width="620" />
-</p>
+> `開啟 CodexWorkResumer 管理面板` *(Open the CodexWorkResumer management panel)*
 
 Built with vanilla TypeScript and embedded into the Go MCP binary via Go `embed`, the panel requires no Node.js runtime and performs zero external network requests. It displays:
 - Watchdog health, monitored session directories, and timestamp of last scan;
@@ -182,19 +193,15 @@ Built with vanilla TypeScript and embedded into the Go MCP binary via Go `embed`
 ### End-User Installation
 
 1. Download and extract the self-contained Windows x64 release ZIP.
-2. Fully close Codex App, then double-click `安装.cmd`.
+2. Double-click `安裝.cmd`; normal official-backend Codex sessions may remain open.
 3. The installer verifies file hashes via SHA-256, registers current-user startup, deploys the local watchdog under `%LOCALAPPDATA%\CodexAutoRetry`, and registers the Codex plugin.
 4. Neither administrator rights nor Go/Node.js dependencies are required.
 
 ### Administrative & Break-Glass Tools
 
-- `启动管理器.cmd`: Launches a windowed startup manager (without leaving a command console) showing exact startup commands, supervisor status, heartbeat, and Windows `StartupApproved` status.
+- `啟動管理器.cmd`: Launches a windowed startup manager (without leaving a command console) showing exact startup commands, supervisor status, heartbeat, and Windows `StartupApproved` status.
 - `安全停用.cmd`: One-click emergency script that immediately disables shared mode, clears plugin-owned registry values, and restores Codex to official direct execution.
-- `卸载.cmd`: Cleanly uninstalls the watchdog and plugin while preserving user settings and logs by default. Run `.\uninstall-release.ps1 -RemoveData` to perform a full cleanup.
-
-<p align="center">
-  <img src="assets/startup_manager.png" alt="Codex Auto Retry Startup Manager" width="560" />
-</p>
+- `卸載.cmd`: Cleanly uninstalls the watchdog and plugin while preserving user settings and logs by default. Run `.\uninstall-release.ps1 -RemoveData` to perform a full cleanup.
 
 ---
 
@@ -212,7 +219,7 @@ The watchdog is built with a **Fail-Open** guarantee:
 ## Limitations
 
 - **Authentication**: Permanently revoked or expired logins cannot be bypassed; user re-authentication is required.
-- **Runtime Requirement**: Codex App must be open for retries to dispatch.
+- **Runtime Requirement**: Primary in-place recovery requires Codex App. The optional background CLI fallback can operate independently but is disabled by default and does not display its result in the original Desktop window.
 - **OS Support**: Tray controller and IPC routes require Windows 10 or Windows 11 (x64).
 - **Completion Notifications**: The `ChatGPT finished a turn` notification is emitted by Codex App before an empty-response failure can be classified. To suppress it, use Codex's native **Settings > General > Notifications > Turn completion notifications > Never** setting.
 
@@ -220,6 +227,8 @@ The watchdog is built with a **Fail-Open** guarantee:
 
 ## Maintainer
 
-Maintained by [`sybxxx`](https://github.com/sybxxx) (TQY Local Tools).
+This fork is maintained by [`waterisme`](https://github.com/waterisme). The original Codex Auto Retry project and its contributors are credited in the [license](LICENSE) and [third-party notices](THIRD_PARTY_NOTICES.md). The [third-party license bundle](THIRD_PARTY_LICENSES.txt) contains the dependency license texts shipped with the Windows package.
 
 Licensed under the [MIT License](LICENSE).
+
+Public-release preparation and outstanding checks: [readiness checklist](docs/PUBLICATION_READINESS.md).

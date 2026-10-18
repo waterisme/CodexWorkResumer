@@ -16,24 +16,29 @@ import (
 const currentControlVersion = 1
 
 type ControlState struct {
-	Version   int       `json:"version"`
-	Paused    bool      `json:"paused"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Version          int       `json:"version"`
+	Paused           bool      `json:"paused"`
+	MonitoringPaused bool      `json:"monitoring_paused"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 type ControlCommandAction string
 
 const (
-	commandRetryNow     ControlCommandAction = "retry_now"
-	commandCancelRetry  ControlCommandAction = "cancel_retry"
-	commandRestartRetry ControlCommandAction = "restart_retry"
+	commandRetryNow            ControlCommandAction = "retry_now"
+	commandCancelRetry         ControlCommandAction = "cancel_retry"
+	commandRestartRetry        ControlCommandAction = "restart_retry"
+	commandResumeTask          ControlCommandAction = "resume_task"
+	commandConfirmTaskComplete ControlCommandAction = "confirm_task_complete"
 )
 
 type ControlCommand struct {
-	Version   int                  `json:"version"`
-	Action    ControlCommandAction `json:"action"`
-	ThreadID  string               `json:"thread_id"`
-	CreatedAt time.Time            `json:"created_at"`
+	Version     int                  `json:"version"`
+	Action      ControlCommandAction `json:"action"`
+	ThreadID    string               `json:"thread_id"`
+	RolloutPath string               `json:"rollout_path,omitempty"`
+	Class       FailureClass         `json:"class,omitempty"`
+	CreatedAt   time.Time            `json:"created_at"`
 }
 
 type controlCommandFile struct {
@@ -67,11 +72,34 @@ func loadOrCreateControlState(path string) (ControlState, error) {
 }
 
 func saveControlState(path string, paused bool, now time.Time) (ControlState, error) {
-	state := ControlState{
-		Version:   currentControlVersion,
-		Paused:    paused,
-		UpdatedAt: now.UTC(),
+	return updateControlState(path, now, func(state *ControlState) {
+		state.Paused = paused
+	})
+}
+
+func saveMonitoringPaused(path string, paused bool, now time.Time) (ControlState, error) {
+	return updateControlState(path, now, func(state *ControlState) {
+		state.MonitoringPaused = paused
+	})
+}
+
+func saveControlSettings(path string, autoResumePaused, monitoringPaused bool, now time.Time) (ControlState, error) {
+	return updateControlState(path, now, func(state *ControlState) {
+		state.Paused = autoResumePaused
+		state.MonitoringPaused = monitoringPaused
+	})
+}
+
+func updateControlState(path string, now time.Time, mutate func(*ControlState)) (ControlState, error) {
+	state, err := loadOrCreateControlState(path)
+	if err != nil {
+		return ControlState{}, err
 	}
+	if mutate != nil {
+		mutate(&state)
+	}
+	state.Version = currentControlVersion
+	state.UpdatedAt = now.UTC()
 	if err := writeJSONAtomic(path, state); err != nil {
 		return ControlState{}, err
 	}
@@ -79,12 +107,18 @@ func saveControlState(path string, paused bool, now time.Time) (ControlState, er
 }
 
 func queueControlCommand(directory string, action ControlCommandAction, threadID string, now time.Time) (ControlCommand, error) {
+	return queueControlCommandWithTask(directory, action, threadID, "", classNone, now)
+}
+
+func queueControlCommandWithTask(directory string, action ControlCommandAction, threadID, rolloutPath string, class FailureClass, now time.Time) (ControlCommand, error) {
 	threadID = strings.ToLower(strings.TrimSpace(threadID))
 	command := ControlCommand{
-		Version:   currentControlVersion,
-		Action:    action,
-		ThreadID:  threadID,
-		CreatedAt: now.UTC(),
+		Version:     currentControlVersion,
+		Action:      action,
+		ThreadID:    threadID,
+		RolloutPath: strings.TrimSpace(rolloutPath),
+		Class:       class,
+		CreatedAt:   now.UTC(),
 	}
 	if err := command.validate(); err != nil {
 		return ControlCommand{}, err
@@ -107,7 +141,7 @@ func (c ControlCommand) validate() error {
 	if c.Version != currentControlVersion {
 		return fmt.Errorf("command version must be %d", currentControlVersion)
 	}
-	if c.Action != commandRetryNow && c.Action != commandCancelRetry && c.Action != commandRestartRetry {
+	if c.Action != commandRetryNow && c.Action != commandCancelRetry && c.Action != commandRestartRetry && c.Action != commandResumeTask && c.Action != commandConfirmTaskComplete {
 		return errors.New("unsupported control command")
 	}
 	if threadIDFromPath(c.ThreadID+".jsonl") != strings.ToLower(c.ThreadID) {
@@ -116,7 +150,24 @@ func (c ControlCommand) validate() error {
 	if c.CreatedAt.IsZero() {
 		return errors.New("command timestamp is required")
 	}
+	if c.Action == commandResumeTask {
+		if strings.TrimSpace(c.RolloutPath) == "" || !filepath.IsAbs(c.RolloutPath) || !strings.EqualFold(threadIDFromPath(c.RolloutPath), c.ThreadID) {
+			return errors.New("valid task rollout path is required")
+		}
+		if !catalogResumeClassAllowed(c.Class) {
+			return errors.New("retryable failure class is required")
+		}
+	}
 	return nil
+}
+
+func catalogResumeClassAllowed(class FailureClass) bool {
+	switch class {
+	case classTransient, classRateLimit, classServer, classAuthTransient, classAuthLimited, classEmptyResponse, classUnknown:
+		return true
+	default:
+		return false
+	}
 }
 
 func loadControlCommandFiles(directory string) ([]controlCommandFile, []string, error) {

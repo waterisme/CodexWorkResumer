@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadStateMigratesLegacyRetryCounter(t *testing.T) {
@@ -38,7 +39,7 @@ func TestLoadStateMigratesLegacyRetryCounter(t *testing.T) {
 		t.Fatal(err)
 	}
 	thread := state.Threads["019fa94e-0103-7183-b405-36bd307b6db2"]
-	if state.Version != 5 || thread.RecoveryAttempts != 4 || thread.ConsecutiveRetries != 4 ||
+	if state.Version != 6 || thread.RecoveryAttempts != 4 || thread.ConsecutiveRetries != 4 ||
 		thread.LegacyFailures != 0 || thread.Pending == nil || thread.Pending.ConsecutiveRetry != 4 ||
 		thread.Pending.MaxConsecutive != 15 {
 		t.Fatalf("legacy retry counter was not migrated into both conservative counters: %+v", thread)
@@ -49,6 +50,22 @@ func TestLoadStateMigratesLegacyRetryCounter(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "consecutive_failures") {
 		t.Fatal("legacy retry counter remained in migrated state")
+	}
+}
+
+func TestRuntimeStatePersistsLastResumeDispatchForRestartSpacing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	state := newRuntimeState()
+	state.LastResumeDispatchAt = time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	if err := writeRuntimeStateAtomic(path, state); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Version != 6 || !loaded.LastResumeDispatchAt.Equal(state.LastResumeDispatchAt) {
+		t.Fatalf("resume spacing state did not survive restart: %+v", loaded)
 	}
 }
 

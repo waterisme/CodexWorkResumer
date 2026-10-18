@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"time"
 )
@@ -21,6 +22,7 @@ func (d *daemon) reconcileStartupState(now time.Time) {
 			OriginTurnStartedAt: awaiting.OriginTurnStartedAt,
 			Class:               awaiting.Class,
 			DueAt:               now,
+			WaitReason:          awaiting.WaitReason,
 			CodexHome:           awaiting.CodexHome,
 			RolloutPath:         awaiting.RolloutPath,
 			Attempt:             awaiting.Attempt,
@@ -109,6 +111,57 @@ func (d *daemon) stopPendingRetryLocked(threadID string, thread ThreadState, now
 
 func (d *daemon) applyControlCommandLocked(command ControlCommand, now time.Time) {
 	thread, found := d.state.Threads[command.ThreadID]
+	if command.Action == commandConfirmTaskComplete {
+		if !d.confirmTaskCompleteLocked(command.ThreadID, now) {
+			d.logger.Printf("completion confirmation ignored thread=%s reason=not_current_or_running", shortThreadID(command.ThreadID))
+		} else {
+			d.logger.Printf("completion confirmed thread=%s source=user", shortThreadID(command.ThreadID))
+		}
+		return
+	}
+	if command.Action == commandResumeTask {
+		command.RolloutPath = normalizeCatalogRolloutPath(command.RolloutPath)
+		root, err := validateCatalogResumePath(d.config, command.ThreadID, command.RolloutPath)
+		if err != nil {
+			d.logger.Printf("control command ignored thread=%s reason=invalid_task_path", shortThreadID(command.ThreadID))
+			return
+		}
+		if found && thread.Awaiting != nil {
+			d.logger.Printf("control command ignored thread=%s reason=retry_already_running", shortThreadID(command.ThreadID))
+			return
+		}
+		if found && thread.Pending != nil {
+			// A catalog discovery may race with the rollout scanner. The
+			// existing retry owns its deadline, including a quota reset wait.
+			// A structured quota code can still upgrade an unknown rollout
+			// failure so the existing retry passes through the quota preflight.
+			if thread.Pending.Class == classUnknown && command.Class == classRateLimit {
+				thread.Pending.Class = classRateLimit
+				d.state.Threads[command.ThreadID] = thread
+				d.logger.Printf("catalog retry classified thread=%s category=rate_limit", shortThreadID(command.ThreadID))
+				return
+			}
+			d.logger.Printf("catalog retry ignored thread=%s reason=retry_already_queued", shortThreadID(command.ThreadID))
+			return
+		}
+		recoveryLimit, consecutiveLimit := retryLimits(command.Class, d.config)
+		thread.Stopped = nil
+		thread.GoalStop = nil
+		thread.GoalHeld = false
+		thread.RecoveryAttempts = 1
+		thread.ConsecutiveRetries = 1
+		thread.RecoveryStartedAt = now
+		thread.LastFailureAt = now
+		thread.Pending = &PendingRetry{
+			EventKey: fmt.Sprintf("catalog:%s:%d", command.ThreadID, command.CreatedAt.UnixNano()),
+			FailedAt: now, Class: command.Class, DueAt: now, CodexHome: root.CodexHome,
+			RolloutPath: command.RolloutPath, Attempt: 1, MaxAttempts: recoveryLimit,
+			ConsecutiveRetry: 1, MaxConsecutive: consecutiveLimit,
+		}
+		d.state.Threads[command.ThreadID] = thread
+		d.logger.Printf("catalog retry queued thread=%s category=%s", shortThreadID(command.ThreadID), command.Class)
+		return
+	}
 	if !found {
 		d.logger.Printf("control command ignored thread=%s reason=retry_not_found", shortThreadID(command.ThreadID))
 		return
@@ -172,12 +225,19 @@ func (d *daemon) applyControlCommandLocked(command ControlCommand, now time.Time
 
 func (d *daemon) handleEventLocked(item scannedEvent, now time.Time) {
 	event := item.Event
+	thread := d.state.Threads[item.ThreadID]
+	// Ordinary task progress cannot affect recovery. Do not persist a dedup
+	// marker for it: a long-running manual turn can otherwise add thousands of
+	// entries to the state file. One correlated progress record is sufficient
+	// for the current retry turn's no-progress guard.
+	if event.Kind == "task_progress" && !shouldTrackRetryProgress(thread, event) {
+		return
+	}
 	key := eventKey(item.ThreadID, event)
 	if _, exists := d.state.ProcessedEvents[key]; exists {
 		return
 	}
 	d.state.ProcessedEvents[key] = now
-	thread := d.state.Threads[item.ThreadID]
 
 	switch event.Kind {
 	case "task_started":
@@ -189,7 +249,7 @@ func (d *daemon) handleEventLocked(item scannedEvent, now time.Time) {
 	case "task_complete":
 		d.handleTaskCompleteLocked(item, key, now, thread)
 	case "turn_aborted":
-		d.handleTurnAbortedLocked(item.ThreadID, event, thread)
+		d.handleTurnAbortedLocked(item.ThreadID, event, thread, now)
 	case "thread_goal_updated":
 		d.handleGoalUpdatedLocked(item.ThreadID, event, thread)
 	case "subagent_recovery_notice":
@@ -197,9 +257,21 @@ func (d *daemon) handleEventLocked(item scannedEvent, now time.Time) {
 	}
 }
 
+func shouldTrackRetryProgress(thread ThreadState, event RelevantEvent) bool {
+	return !thread.CurrentTurnProgress && thread.Awaiting != nil &&
+		thread.Awaiting.RetryTurnID != "" &&
+		thread.Awaiting.RetryTurnID == thread.LastStartedTurnID &&
+		(thread.Awaiting.StartedAt.IsZero() || !event.Timestamp.Before(thread.Awaiting.StartedAt))
+}
+
 func (d *daemon) handleTaskStartedLocked(threadID string, event RelevantEvent, thread ThreadState) {
 	thread.LastStartedTurnID = event.TurnID
 	thread.LastStartedAt = event.Timestamp
+	thread.ObservedTurnRunning = true
+	thread.LastPositiveCompletionAt = time.Time{}
+	thread.LastPositiveCompletionObservedAt = time.Time{}
+	thread.LastRecoverySucceededAt = time.Time{}
+	thread.LastTerminalNoRetryAt = time.Time{}
 	thread.CurrentTurnProgress = false
 	if automaticGoalLimitStopped(thread) {
 		d.state.Threads[threadID] = thread
@@ -289,22 +361,26 @@ func (d *daemon) handleTaskProgressLocked(threadID string, event RelevantEvent, 
 	// Progress matters only for the automatic retry turn currently correlated
 	// in state. This prevents a late record from an older or manual turn from
 	// resetting the no-progress guard for a different retry.
-	if thread.Awaiting == nil || thread.Awaiting.RetryTurnID == "" ||
-		thread.Awaiting.RetryTurnID != thread.LastStartedTurnID ||
-		(!thread.Awaiting.StartedAt.IsZero() && event.Timestamp.Before(thread.Awaiting.StartedAt)) {
+	if !shouldTrackRetryProgress(thread, event) {
 		return
 	}
 	thread.CurrentTurnProgress = true
 	d.state.Threads[threadID] = thread
 }
 
-func (d *daemon) handleTurnAbortedLocked(threadID string, event RelevantEvent, thread ThreadState) {
+func (d *daemon) handleTurnAbortedLocked(threadID string, event RelevantEvent, thread ThreadState, now time.Time) {
 	abortedTurnID := event.TurnID
 	if abortedTurnID == "" {
 		abortedTurnID = thread.LastStartedTurnID
 	}
 	thread.LastAbortedTurnID = abortedTurnID
 	thread.LastAbortedAt = event.Timestamp
+	if abortedTurnID != "" && abortedTurnID == thread.LastStartedTurnID {
+		thread.ObservedTurnRunning = false
+		thread.LastPositiveCompletionAt = time.Time{}
+		thread.LastPositiveCompletionObservedAt = time.Time{}
+		thread.LastTerminalNoRetryAt = now
+	}
 	if automaticGoalLimitStopped(thread) {
 		d.state.Threads[threadID] = thread
 		return
@@ -329,6 +405,9 @@ func (d *daemon) handleTurnAbortedLocked(threadID string, event RelevantEvent, t
 
 func (d *daemon) handleTaskCompleteLocked(item scannedEvent, key string, now time.Time, thread ThreadState) {
 	event := item.Event
+	if event.TurnID != "" && event.TurnID == thread.LastStartedTurnID {
+		thread.ObservedTurnRunning = false
+	}
 	if automaticGoalLimitStopped(thread) {
 		d.state.Threads[item.ThreadID] = thread
 		d.logger.Printf("completion ignored thread=%s reason=%s", shortThreadID(item.ThreadID), thread.Stopped.Reason)
@@ -342,10 +421,13 @@ func (d *daemon) handleTaskCompleteLocked(item scannedEvent, key string, now tim
 	if thread.Awaiting != nil {
 		awaiting := thread.Awaiting
 		if awaiting.RetryTurnID == "" || awaiting.RetryTurnID != event.TurnID {
+			d.state.Threads[item.ThreadID] = thread
 			d.logger.Printf("completion ignored thread=%s reason=turn_mismatch", shortThreadID(item.ThreadID))
 			return
 		}
 		if completionSucceeded(event) {
+			recordPositiveCompletion(&thread, event, now)
+			thread.LastRecoverySucceededAt = now
 			d.logger.Printf("retry chain recovered thread=%s recovery_attempt=%d consecutive_retry=%d", shortThreadID(item.ThreadID), awaiting.Attempt, awaiting.ConsecutiveRetry)
 			d.resetRetryStateLocked(item.ThreadID, thread)
 			return
@@ -362,21 +444,36 @@ func (d *daemon) handleTaskCompleteLocked(item scannedEvent, key string, now tim
 
 	if thread.Pending != nil {
 		if thread.Pending.FailedTurnID != event.TurnID {
+			d.state.Threads[item.ThreadID] = thread
 			d.logger.Printf("completion ignored thread=%s reason=pending_turn_mismatch", shortThreadID(item.ThreadID))
 			return
 		}
 		if completionSucceeded(event) {
+			recordPositiveCompletion(&thread, event, now)
 			d.resetRetryStateLocked(item.ThreadID, thread)
 		}
 		return
 	}
 
 	if completionSucceeded(event) {
+		recordPositiveCompletion(&thread, event, now)
 		d.resetRetryStateLocked(item.ThreadID, thread)
 		return
 	}
 	thread.CurrentTurnProgress = false
 	d.scheduleFailureLocked(item, key, now, thread, 1, 1, externalTurnOrigin(thread, event), false)
+}
+
+// A terminal lifecycle record with a known final reply is positive evidence
+// for the scheduler. A generic successful turn (whose final reply was not
+// reported) remains insufficient for unattended sequential handoff.
+func recordPositiveCompletion(thread *ThreadState, event RelevantEvent, observedAt time.Time) {
+	if event.TurnID == "" || event.TurnID != thread.LastStartedTurnID ||
+		!event.FinalKnown || !event.FinalPresent || event.Timestamp.Before(thread.LastStartedAt) {
+		return
+	}
+	thread.LastPositiveCompletionAt = event.Timestamp
+	thread.LastPositiveCompletionObservedAt = observedAt
 }
 
 func (d *daemon) scheduleFailureLocked(item scannedEvent, key string, now time.Time, thread ThreadState, recoveryAttempt, consecutiveRetry int, originTurnStartedAt time.Time, parentNotified bool) {
@@ -408,7 +505,10 @@ func (d *daemon) scheduleFailureLocked(item scannedEvent, key string, now time.T
 		return
 	}
 	recoveryLimit, consecutiveLimit := retryLimitsForDecision(decision, d.config)
-	timeLimitExceeded := now.Sub(thread.RecoveryStartedAt) > maxAutomaticRecoveryDuration
+	// A rate-limit event must reach the quota preflight before it can be called
+	// ordinary/transient or a real quota exhaustion. Keep the normal attempt
+	// ceilings, but do not let a multi-hour quota wait trip the 30-minute guard.
+	timeLimitExceeded := decision.Class != classRateLimit && now.Sub(thread.RecoveryStartedAt) > maxAutomaticRecoveryDuration
 	if timeLimitExceeded || recoveryAttempt > recoveryLimit || consecutiveRetry > consecutiveLimit {
 		completedAttempts := completedRetryCount(recoveryAttempt, recoveryLimit)
 		completedConsecutive := completedRetryCount(consecutiveRetry, consecutiveLimit)

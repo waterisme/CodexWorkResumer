@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -16,6 +17,7 @@ import (
 type localSettingsPayload struct {
 	RetrySettings
 	Paused                 bool  `json:"paused"`
+	MonitoringPaused       *bool `json:"monitoring_paused,omitempty"`
 	SharedAppServerEnabled *bool `json:"shared_app_server_enabled,omitempty"`
 }
 
@@ -81,6 +83,60 @@ func prepareSharedBackendAtStartup(ctx context.Context, configPath, dataDir stri
 	return result
 }
 
+var (
+	enableSharedAppServerAtStartup  = enableSharedAppServer
+	disableSharedAppServerAtStartup = disableSharedAppServer
+)
+
+// reconcileSharedBackendPreferenceAtStartup applies the saved user choice, not
+// merely the last effective runtime state. A temporary health failure leaves
+// Requested=true and Enabled=false; the next process start must make one safe,
+// bounded attempt to enable it again. Disabling is persisted before cleanup so
+// a deferred shutdown can never reactivate the route on a later start.
+func reconcileSharedBackendPreferenceAtStartup(ctx context.Context, configPath, dataDir string, config Config) (Config, error) {
+	desired := config.SharedAppServerRequested
+	if desired == config.SharedAppServerEnabled {
+		return config, nil
+	}
+	if desired {
+		prepared, err := enableSharedAppServerAtStartup(ctx, dataDir, config)
+		if err != nil {
+			return config, err
+		}
+		persisted, err := updateConfigFile(configPath, func(current *Config) error {
+			if !current.SharedAppServerRequested {
+				return fmt.Errorf("shared app-server enable cancelled by user")
+			}
+			current.SharedAppServerEnabled = true
+			current.SharedAppServerPort = prepared.SharedAppServerPort
+			return nil
+		})
+		if err != nil {
+			_ = disableSharedAppServerAtStartup(context.Background(), dataDir, prepared)
+			return config, err
+		}
+		for _, marker := range []string{"shared-availability.json", sharedFailOpenMarkerName} {
+			if err := os.Remove(filepath.Join(dataDir, marker)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return persisted, err
+			}
+		}
+		return persisted, nil
+	}
+
+	persisted, err := updateConfigFile(configPath, func(current *Config) error {
+		current.SharedAppServerRequested = false
+		current.SharedAppServerEnabled = false
+		return nil
+	})
+	if err != nil {
+		return config, err
+	}
+	if err := disableSharedAppServerAtStartup(ctx, dataDir, persisted); err != nil {
+		return persisted, err
+	}
+	return persisted, nil
+}
+
 const (
 	localSettingsExitFailure      = 1
 	localSettingsExitPortReserved = 2
@@ -90,7 +146,7 @@ const (
 func main() {
 	arguments := os.Args[1:]
 	mode := "run"
-	if len(arguments) > 0 && (arguments[0] == "run" || arguments[0] == "supervise" || arguments[0] == "mcp" || arguments[0] == "save-settings" || arguments[0] == "control") {
+	if len(arguments) > 0 && (arguments[0] == "run" || arguments[0] == "supervise" || arguments[0] == "mcp" || arguments[0] == "save-settings" || arguments[0] == "control" || arguments[0] == "diagnostics") {
 		mode = arguments[0]
 		arguments = arguments[1:]
 	}
@@ -130,9 +186,15 @@ func main() {
 		}
 		return
 	}
+	if mode == "diagnostics" {
+		if err := runLocalDiagnostics(dataDir, *actionFlag, time.Now().UTC()); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	if mode == "mcp" {
 		if err := runManagementMCP(dataDir); err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, "Codex Auto Retry MCP server stopped:", err)
+			_, _ = fmt.Fprintln(os.Stderr, "CodexWorkResumer MCP server stopped:", err)
 		}
 		return
 	}
@@ -154,6 +216,7 @@ func main() {
 		return
 	}
 	defer logger.Close()
+	logger.ConfigureDebug(filepath.Join(dataDir, diagnosticSettingsFileName))
 	logger.Printf("watchdog starting version=%s", appVersion)
 
 	configPath := filepath.Join(dataDir, "config.json")
@@ -188,6 +251,19 @@ func main() {
 			logger.Printf("shared app-server startup cleanup remains deferred category=%s", startupFailOpenReason)
 		} else {
 			_ = os.Remove(filepath.Join(dataDir, sharedFailOpenMarkerName))
+		}
+	}
+	if _, markerErr := os.Stat(filepath.Join(dataDir, sharedFailOpenMarkerName)); errors.Is(markerErr, os.ErrNotExist) &&
+		config.SharedAppServerRequested != config.SharedAppServerEnabled {
+		desired := config.SharedAppServerRequested
+		preferenceCtx, preferenceCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		reconciled, reconcileErr := reconcileSharedBackendPreferenceAtStartup(preferenceCtx, configPath, dataDir, config)
+		preferenceCancel()
+		config = reconciled
+		if reconcileErr != nil {
+			logger.Printf("saved shared app-server preference could not be applied at startup enabled=%t category=shared_preference", desired)
+		} else {
+			logger.Printf("saved shared app-server preference applied at startup enabled=%t", desired)
 		}
 	}
 	manager := newSharedServerManager(config, dataDir, logger)
@@ -348,7 +424,7 @@ func saveLocalSettings(dataDir, settingsPath string) error {
 			return err
 		}
 	}
-	return service.setLocalSettings(payload.RetrySettings, payload.Paused, now)
+	return service.setLocalSettings(payload.RetrySettings, payload.Paused, payload.MonitoringPaused, now)
 }
 
 func runLocalControl(dataDir, action, threadID string) error {
@@ -361,6 +437,41 @@ func runLocalControl(dataDir, action, threadID string) error {
 	service := newManagementService(dataDir)
 	now := time.Now().UTC()
 	switch action {
+	case localSaveTaskPlanAction:
+		_, err := saveTaskPlanJSON(filepath.Join(dataDir, "task-plan.json"), os.Getenv("CODEX_AUTO_RETRY_TASK_PLAN"), now)
+		return err
+	case "set_paused":
+		value := os.Getenv("CODEX_AUTO_RETRY_PAUSED")
+		if value != "true" && value != "false" {
+			return fmt.Errorf("CODEX_AUTO_RETRY_PAUSED must be true or false")
+		}
+		_, err := saveControlState(filepath.Join(dataDir, "control.json"), value == "true", now)
+		return err
+	case "set_scheduler_settings":
+		mode := os.Getenv("CODEX_AUTO_RETRY_QUOTA_RESUME_MODE")
+		interval, err := strconv.Atoi(os.Getenv("CODEX_AUTO_RETRY_RESUME_INTERVAL_SECONDS"))
+		if err != nil {
+			return fmt.Errorf("invalid scheduler resume interval: %w", err)
+		}
+		parallel, err := strconv.Atoi(os.Getenv("CODEX_AUTO_RETRY_MAX_PARALLEL_SESSIONS"))
+		if err != nil {
+			return fmt.Errorf("invalid scheduler parallel limit: %w", err)
+		}
+		refresh, err := strconv.Atoi(os.Getenv("CODEX_AUTO_RETRY_USAGE_REFRESH_MINUTES"))
+		if err != nil {
+			return fmt.Errorf("invalid scheduler quota refresh: %w", err)
+		}
+		_, err = updateConfigFile(filepath.Join(dataDir, "config.json"), func(config *Config) error {
+			config.QuotaResumeMode = mode
+			config.ResumeIntervalSeconds = interval
+			config.MaxParallelSessions = parallel
+			config.UsageRefreshMinutes = refresh
+			return nil
+		})
+		return err
+	case string(commandConfirmTaskComplete):
+		_, err := queueControlCommand(filepath.Join(dataDir, "commands"), commandConfirmTaskComplete, threadID, now)
+		return err
 	case string(commandRetryNow):
 		_, err := service.retryNow(threadID, now)
 		return err
@@ -369,6 +480,11 @@ func runLocalControl(dataDir, action, threadID string) error {
 		return err
 	case string(commandRestartRetry):
 		_, err := service.restartRetry(threadID, now)
+		return err
+	case string(commandResumeTask):
+		rolloutPath := os.Getenv("CODEX_AUTO_RETRY_ROLLOUT_PATH")
+		class := FailureClass(os.Getenv("CODEX_AUTO_RETRY_FAILURE_CLASS"))
+		_, err := service.resumeTask(threadID, rolloutPath, class, now)
 		return err
 	default:
 		return fmt.Errorf("unsupported control action")

@@ -84,6 +84,11 @@ try {
     if ($trayWindow -eq [IntPtr]::Zero) {
         throw 'Tray window was not created.'
     }
+    $miniClassName = "CodexWorkResumerMini-$($process.Id)"
+    if ([CodexAutoRetryTrayProbe]::FindWindow($miniClassName, $miniClassName) -ne [IntPtr]::Zero -or
+        (Test-Path -LiteralPath (Join-Path $dataDir 'mini-monitor.json'))) {
+        throw 'Watchdog still created the embedded Mini Monitor or its preferences.'
+    }
     $statusPath = Join-Path $dataDir 'status.json'
     $deadline = (Get-Date).AddSeconds(10)
     do {
@@ -96,14 +101,14 @@ try {
     if (-not $status -or -not $status.running -or $status.pid -ne $process.Id) {
         throw 'Tray watchdog did not publish a valid heartbeat.'
     }
-    if (-not [CodexAutoRetryTrayProbe]::PostMessage($trayWindow, 0x0111, [IntPtr]1001, [IntPtr]::Zero)) {
-        throw 'Could not request the graphical settings window through the tray controller.'
+    if (-not [CodexAutoRetryTrayProbe]::PostMessage($trayWindow, 0x8001, [IntPtr]::Zero, [IntPtr]0x0202)) {
+        throw 'Could not request the graphical settings window with a tray single click.'
     }
     $settingsMarker = Join-Path $dataDir 'settings-smoke.ok'
     $deadline = (Get-Date).AddSeconds(10)
     do { Start-Sleep -Milliseconds 200 } while (-not (Test-Path -LiteralPath $settingsMarker) -and (Get-Date) -lt $deadline)
     if (-not (Test-Path -LiteralPath $settingsMarker)) {
-        throw 'The tray settings window did not initialize.'
+        throw 'A tray single click did not open the graphical settings window.'
     }
     $settingsLayoutMarker = Join-Path $dataDir 'settings-layout-smoke.ok'
     if (-not (Test-Path -LiteralPath $settingsLayoutMarker) -or
@@ -139,8 +144,13 @@ try {
         }
     } while ((Get-Date) -lt $refreshDeadline)
     New-Item -ItemType File -Force -Path (Join-Path $dataDir 'settings-smoke-close.signal') | Out-Null
+    [void][CodexAutoRetryTrayProbe]::PostMessage($settingsWindow, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
     if (-not $settingsProcess.WaitForExit(10000)) {
         throw 'The tray settings window did not close cleanly.'
+    }
+    $settingsError = Join-Path $dataDir 'settings-smoke-error.txt'
+    if (Test-Path -LiteralPath $settingsError) {
+        throw ('The tray settings window reported an error: ' + (Get-Content -Raw -Encoding UTF8 -LiteralPath $settingsError))
     }
     $logPath = Join-Path $dataDir 'logs\daemon.log'
     $log = if (Test-Path -LiteralPath $logPath) { Get-Content -Raw -Encoding UTF8 -LiteralPath $logPath } else { '' }
@@ -158,6 +168,8 @@ try {
     [pscustomobject]@{
         Status = 'passed'
         TrayWindowCreated = $true
+        EmbeddedMiniAbsent = $true
+        SingleClickOpensSettings = $true
         SettingsWindowInitialized = $true
         SettingsWindowVisible = $true
         SettingsLayoutSeparated = $true

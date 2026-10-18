@@ -247,11 +247,38 @@ func collectErrorStrings(value any, parts *[]string, depth int) {
 			collectErrorStrings(item, parts, depth+1)
 		}
 	case map[string]any:
-		for _, key := range []string{"type", "code", "message", "error", "detail", "reason"} {
+		for _, key := range []string{"type", "code", "message", "error", "detail", "reason", "codex_error_info", "codexErrorInfo"} {
 			if item, ok := typed[key]; ok {
+				if key == "codex_error_info" || key == "codexErrorInfo" {
+					// Codex also represents this code as a tagged object. Only
+					// retain known quota tags, never their metadata (such as reset details).
+					// Unknown tags must not corrupt a message containing JSON that
+					// the classifier needs to parse as one complete value.
+					if tagged, ok := item.(map[string]any); ok && len(tagged) == 1 {
+						for code := range tagged {
+							if len(*parts) < 12 && isStructuredQuotaCode(code) {
+								*parts = append(*parts, code)
+							}
+						}
+						continue
+					}
+					if code, ok := item.(string); ok && isStructuredQuotaCode(code) {
+						*parts = append(*parts, code)
+					}
+					continue
+				}
 				collectErrorStrings(item, parts, depth+1)
 			}
 		}
+	}
+}
+
+func isStructuredQuotaCode(code string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "usage_limit_exceeded", "usagelimitexceeded", "rate_limit_exceeded", "ratelimitexceeded", "session_budget_exceeded", "sessionbudgetexceeded":
+		return true
+	default:
+		return false
 	}
 }
 

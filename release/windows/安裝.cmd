@@ -1,9 +1,9 @@
 @echo off
 setlocal
 chcp 65001 >nul
-title Codex Auto Retry Installer
+title CodexWorkResumer Installer
 echo.
-echo Codex Auto Retry - one-click installer
+echo CodexWorkResumer - one-click installer
 echo.
 powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0deploy.ps1"
 set "EXIT_CODE=%ERRORLEVEL%"

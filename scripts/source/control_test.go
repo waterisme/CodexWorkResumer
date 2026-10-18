@@ -23,6 +23,24 @@ func TestControlStatePersistsPause(t *testing.T) {
 	}
 }
 
+func TestControlStateKeepsIndependentPauseFlags(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "control.json")
+	now := time.Date(2026, 9, 21, 5, 0, 0, 0, time.UTC)
+	if _, err := saveMonitoringPaused(path, true, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := saveControlState(path, true, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadOrCreateControlState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.Paused || !loaded.MonitoringPaused {
+		t.Fatalf("independent pause flags did not round trip: %+v", loaded)
+	}
+}
+
 func TestControlCommandQueueValidatesAndOrdersCommands(t *testing.T) {
 	directory := filepath.Join(t.TempDir(), "commands")
 	threadID := "019f9d5d-9c82-75b1-b7c0-20a658af0423"
@@ -56,5 +74,21 @@ func TestControlCommandQueueValidatesAndOrdersCommands(t *testing.T) {
 	_, invalid, err = loadControlCommandFiles(directory)
 	if err != nil || len(invalid) != 1 {
 		t.Fatalf("invalid command was not isolated: invalid=%v err=%v", invalid, err)
+	}
+}
+
+func TestCatalogResumeCommandCarriesValidatedRollout(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "commands")
+	threadID := "019f9d5d-9c82-75b1-b7c0-20a658af0423"
+	rollout := filepath.Join(t.TempDir(), "rollout-2026-10-01T01-02-03-"+threadID+".jsonl")
+	command, err := queueControlCommandWithTask(directory, commandResumeTask, threadID, rollout, classRateLimit, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.RolloutPath != rollout || command.Class != classRateLimit {
+		t.Fatalf("catalog resume metadata was lost: %+v", command)
+	}
+	if _, err := queueControlCommandWithTask(directory, commandResumeTask, threadID, filepath.Join(t.TempDir(), "wrong.jsonl"), classRateLimit, time.Now().UTC()); err == nil {
+		t.Fatal("mismatched rollout path was accepted")
 	}
 }
